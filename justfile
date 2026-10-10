@@ -7,7 +7,7 @@ export PATH := `go env GOPATH` + "/bin:" + env("PATH")
 
 version := `cat VERSION | tr -d '[:space:]'`
 ldflags := "-s -w -X main.version=" + version
-tools := "kgc kgpv"
+tools := "kgc kgpv ksd"
 
 default:
     @just --list
@@ -18,14 +18,14 @@ setup:
     go install golang.org/x/vuln/cmd/govulncheck@latest
     go mod download
 
-# Build both binaries for the host platform into ./bin
+# Build all binaries for the host platform into ./bin
 build:
     mkdir -p bin
     for tool in {{tools}}; do \
         go build -ldflags "{{ldflags}}" -o "bin/$tool" "./cmd/$tool"; \
     done
 
-# Install both binaries into GOBIN
+# Install all binaries into GOBIN
 install:
     for tool in {{tools}}; do \
         go install -ldflags "{{ldflags}}" "./cmd/$tool"; \

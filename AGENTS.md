@@ -8,6 +8,7 @@ kutils is a small collection of Kubernetes CLI utilities written in Go, one bina
 
 - `kgc` (`cmd/kgc`) — `kubectl get pods` style view per container, color-coded status and last restart reason; supports watch mode.
 - `kgpv` (`cmd/kgpv`) — lists PersistentVolumes with bound PVC, pod, zone, storageClass and size; supports YAML/CSV output.
+- `ksd` (`cmd/ksd`) — prints a Secret like `kubectl get secret -oyaml` with values base64-decoded (certificate details, `-k`, `-o`, fzf picker); the shell completion scripts call the hidden `ksd __complete WORDS...` subcommand for dynamic secret/namespace/key names.
 
 Each tool is a single self-contained `main.go` (plus `main_test.go`) in its own `cmd/<tool>/` directory. There is no shared internal package; helpers are intentionally duplicated per tool, so a change to common behavior (kubeconfig loading, shell completions, version handling) usually needs to be made in both. `kgpv` works mostly on unstructured maps (`getMapValue`, `getStringValue`, …) while `kgc` uses typed `client-go` objects.
 
