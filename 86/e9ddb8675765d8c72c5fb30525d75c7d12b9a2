@@ -1,0 +1,19 @@
+AGENTS.md
+  s_85b3ded20d6dff::t_b43d2985a1b7fe 1-31
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "86e9ddb8675765d8c72c5fb30525d75c7d12b9a2",
+  "prompts": {},
+  "sessions": {
+    "s_85b3ded20d6dff": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "541d4fd6-350d-41c7-86d8-38e52da258bb",
+        "model": "unknown"
+      },
+      "human_author": "jesse goodier <31039225+jessegoodier@users.noreply.github.com>"
+    }
+  }
+}
