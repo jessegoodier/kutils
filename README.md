@@ -241,11 +241,12 @@ Like `kubectl get nodes`, but with CPU, memory and GPU totals, requests and real
 
 ```
 kgn
-NAME          CPU REQ       CPU USE  MEM REQ         MEM USE  GPU TYPE  GPU REQ  GPU ALLOC  GPU AVAIL  GPU MODEL    PODS    NODE GROUP
-ip-10-0-1-23  41%: 3.2/7.9  27%      37%: 11.2G/30G  22%      -         -        -          -          -            28/110  general
-ip-10-0-2-17  95%: 15.1/16  -        87%: 54G/62G    -        -         -        -          -          -            54/58   general
-ip-10-0-1-88  76%: 6/7.9    61%      33%: 20G/60G    30%      nvidia    2        4          2          NVIDIA-A10G  14/110  gpu
-Total: 3 nodes (1 not ready, 1 cordoned, 1 with issues) · CPU 76%: 24.3/31.8 requested, 35% used · MEM 56%: 85.2G/152G requested, 21% used · nvidia 2/4
+NAME          CPU REQ        CPU USE  MEM REQ          MEM USE  GPU TYPE  GPU REQ  GPU ALLOC  GPU AVAIL  GPU MODEL    PODS    NODE GROUP
+ip-10-0-1-23  41%: 3.2/7.9   27%      37%: 11.2G/30G   22%      -         -        -          -          -            28/110  general
+ip-10-0-2-17  95%: 15.1/16   -        87%: 54G/62G     -        -         -        -          -          -            54/58   general
+ip-10-0-1-88  76%: 6/7.9     61%      33%: 20G/60G     30%      nvidia    2        4          2          NVIDIA-A10G  14/110  gpu
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+Summary       76%: 24.3/31.8 35%      56%: 85.2G/152G  21%      nvidia    2        4          2          NVIDIA-A10G  96/278  -
 ```
 
 ### Features

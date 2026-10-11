@@ -764,14 +764,25 @@ func TestPrintTableAligns(t *testing.T) {
 	}
 }
 
-func TestSummary(t *testing.T) {
+func TestSummaryRow(t *testing.T) {
 	infos := buildInfos(testSnapshot())
-	infos[0].node.Spec.Unschedulable = true
-	infos[0].issues = append(infos[0].issues, issue{lvlWarn, "cordoned", "SchedulingDisabled"})
-	got := summary(infos, tableOpts{})
-	for _, want := range []string{"2 nodes (1 cordoned, 1 with issues)", "CPU 29%: 3.5/12 requested", "nvidia 2/4"} {
-		if !strings.Contains(got, want) {
-			t.Errorf("summary %q missing %q", got, want)
+	opts := tableOpts{showGPU: true}
+	sumRow := buildSummaryRow(infos, opts)
+	if sumRow[0].text != "Summary" {
+		t.Fatalf("first cell = %q, want Summary", sumRow[0].text)
+	}
+
+	headers, rows := buildTable(infos, opts, time.Now())
+	var buf bytes.Buffer
+	printTable(&buf, "", headers, rows, sumRow)
+	out := buf.String()
+
+	if !strings.Contains(out, "─") {
+		t.Errorf("output missing solid divider line: %s", out)
+	}
+	for _, want := range []string{"Summary", "29%: 3.5/12", "5%: 4G/80G", "nvidia", "NVIDIA-A10G", "3/220"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("output missing %q:\n%s", want, out)
 		}
 	}
 }
