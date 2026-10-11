@@ -317,10 +317,11 @@ func main() {
 		showGPU:    slices.ContainsFunc(infos, func(ni *nodeInfo) bool { return len(ni.accels) > 0 }),
 	}
 	headers, rows := buildTable(infos, opts, now)
-	printTable(os.Stdout, "", headers, rows)
+	var summaryRow []cell
 	if len(infos) > 1 {
-		fmt.Println(styleMeta.Sprint(summary(infos, opts)))
+		summaryRow = buildSummaryRow(infos, opts)
 	}
+	printTable(os.Stdout, "", headers, rows, summaryRow)
 
 	if *detail {
 		for _, ni := range infos {
@@ -1326,7 +1327,7 @@ func nodeAddress(n *corev1.Node, t corev1.NodeAddressType) string {
 
 // printTable pads plain text first, then colors it, so ANSI codes never
 // affect alignment.
-func printTable(w io.Writer, indent string, headers []string, rows [][]cell) {
+func printTable(w io.Writer, indent string, headers []string, rows [][]cell, summary ...[]cell) {
 	const gap = 2
 	widths := make([]int, len(headers))
 	for i, h := range headers {
@@ -1334,7 +1335,18 @@ func printTable(w io.Writer, indent string, headers []string, rows [][]cell) {
 	}
 	for _, r := range rows {
 		for i, c := range r {
-			widths[i] = max(widths[i], utf8.RuneCountInString(c.text))
+			if i < len(widths) {
+				widths[i] = max(widths[i], utf8.RuneCountInString(c.text))
+			}
+		}
+	}
+	var sumRow []cell
+	if len(summary) > 0 && len(summary[0]) > 0 {
+		sumRow = summary[0]
+		for i, c := range sumRow {
+			if i < len(widths) {
+				widths[i] = max(widths[i], utf8.RuneCountInString(c.text))
+			}
 		}
 	}
 	pad := func(s string, i int) string {
@@ -1366,26 +1378,67 @@ func printTable(w io.Writer, indent string, headers []string, rows [][]cell) {
 		}
 		_, _ = fmt.Fprintln(w, indent+lb.String())
 	}
+	if len(sumRow) > 0 {
+		totalWidth := 0
+		for i, width := range widths {
+			totalWidth += width
+			if i < len(widths)-1 {
+				totalWidth += gap
+			}
+		}
+		if totalWidth > 0 {
+			_, _ = fmt.Fprintln(w, indent+styleMeta.Sprint(strings.Repeat("─", totalWidth)))
+		}
+		var lb strings.Builder
+		for i, c := range sumRow {
+			if len(c.parts) == 0 {
+				lb.WriteString(c.style.Sprint(pad(c.text, i)))
+				continue
+			}
+			for j, part := range c.parts {
+				if j > 0 {
+					lb.WriteString(c.separator)
+				}
+				lb.WriteString(part.style.Sprint(part.text))
+			}
+			lb.WriteString(strings.TrimPrefix(pad(c.text, i), c.text))
+		}
+		_, _ = fmt.Fprintln(w, indent+lb.String())
+	}
 }
 
-// summary is the cluster-wide footer under the table.
-func summary(infos []*nodeInfo, o tableOpts) string {
-	var notReady, cordoned, unhealthy int
-	var cpu, mem amount
-	gpus := map[corev1.ResourceName]*amount{}
+// buildSummaryRow builds a cluster-wide summary row formatted identically to node rows.
+func buildSummaryRow(infos []*nodeInfo, o tableOpts) []cell {
+	var (
+		cpu, mem       amount
+		totalPodsReq   int64
+		totalPodsAlloc int64
+		gpus           = map[corev1.ResourceName]*amount{}
+		gpuModels      []string
+		gpuLevel       = lvlOK
+	)
 	for _, ni := range infos {
-		if !strings.HasPrefix(ni.status, "Ready") {
-			notReady++
-		}
-		if ni.node.Spec.Unschedulable {
-			cordoned++
-		}
-		if len(ni.issues) > 0 {
-			unhealthy++
-		}
 		c, m := ni.get(corev1.ResourceCPU), ni.get(corev1.ResourceMemory)
-		cpu.req, cpu.alloc, cpu.used = cpu.req+c.req, cpu.alloc+c.alloc, cpu.used+c.used
-		mem.req, mem.alloc, mem.used = mem.req+m.req, mem.alloc+m.alloc, mem.used+m.used
+		cpu.req += c.req
+		cpu.alloc += c.alloc
+		cpu.lim += c.lim
+		cpu.used += c.used
+		if c.hasUsed {
+			cpu.hasUsed = true
+		}
+
+		mem.req += m.req
+		mem.alloc += m.alloc
+		mem.lim += m.lim
+		mem.used += m.used
+		if m.hasUsed {
+			mem.hasUsed = true
+		}
+
+		pods := ni.get(corev1.ResourcePods)
+		totalPodsReq += pods.req
+		totalPodsAlloc += pods.alloc
+
 		for _, a := range ni.accels {
 			g := gpus[a.name]
 			if g == nil {
@@ -1395,44 +1448,100 @@ func summary(infos []*nodeInfo, o tableOpts) string {
 			g.req += a.req
 			g.alloc += a.alloc
 		}
+		if ni.gpuModel != "" && !slices.Contains(gpuModels, ni.gpuModel) {
+			gpuModels = append(gpuModels, ni.gpuModel)
+		}
+		if ni.gpuLevel > gpuLevel {
+			gpuLevel = ni.gpuLevel
+		}
 	}
 
-	parts := []string{fmt.Sprintf("%d nodes", len(infos))}
-	var health []string
-	if notReady > 0 {
-		health = append(health, fmt.Sprintf("%d not ready", notReady))
-	}
-	if cordoned > 0 {
-		health = append(health, fmt.Sprintf("%d cordoned", cordoned))
-	}
-	if unhealthy > 0 {
-		health = append(health, fmt.Sprintf("%d with issues", unhealthy))
-	}
-	if len(health) > 0 {
-		parts[0] += " (" + strings.Join(health, ", ") + ")"
-	}
+	row := []cell{plain("Summary")}
 	for _, r := range []struct {
-		label string
-		name  corev1.ResourceName
-		a     amount
-	}{{"CPU", corev1.ResourceCPU, cpu}, {"MEM", corev1.ResourceMemory, mem}} {
-		p, _ := pct(r.a.req, r.a.alloc)
-		s := fmt.Sprintf("%s %d%%: %s/%s requested", r.label, p, fmtAmount(r.name, r.a.req), fmtAmount(r.name, r.a.alloc))
-		if o.hasMetrics {
-			up, _ := pct(r.a.used, r.a.alloc)
-			s += fmt.Sprintf(", %d%% used", up)
+		name corev1.ResourceName
+		a    amount
+	}{
+		{corev1.ResourceCPU, cpu},
+		{corev1.ResourceMemory, mem},
+	} {
+		if o.wide {
+			req, p, known := valueWithPct(r.name, r.a.req, r.a.alloc)
+			lim, lp, limKnown := valueWithPct(r.name, r.a.lim, r.a.alloc)
+			row = append(row,
+				percentageCell(req, p, known),
+				percentageCell(lim, lp, limKnown),
+				plain(fmtAmount(r.name, r.a.alloc)),
+				plain(fmtAmount(r.name, r.a.avail())),
+			)
+		} else {
+			p, known := pct(r.a.req, r.a.alloc)
+			row = append(row, percentageCell(fmt.Sprintf("%d%%: %s/%s", p, fmtAmount(r.name, r.a.req), fmtAmount(r.name, r.a.alloc)), p, known))
 		}
-		parts = append(parts, s)
+		if o.hasMetrics {
+			row = append(row, usageCell(r.name, r.a, o.wide))
+		}
 	}
-	names := make([]corev1.ResourceName, 0, len(gpus))
-	for name := range gpus {
-		names = append(names, name)
+
+	if o.showGPU {
+		if len(gpus) == 0 {
+			row = append(row, dim("-"), dim("-"), dim("-"), dim("-"), dim("-"))
+		} else {
+			st := styleAccent
+			if gpuLevel != lvlOK {
+				st = gpuLevel.style()
+			}
+			names := make([]corev1.ResourceName, 0, len(gpus))
+			for name := range gpus {
+				names = append(names, name)
+			}
+			slices.Sort(names)
+
+			var types, reqs, allocs, avails []string
+			for _, name := range names {
+				g := gpus[name]
+				types = append(types, acceleratorLabel(name))
+				reqs = append(reqs, strconv.FormatInt(g.req, 10))
+				allocs = append(allocs, strconv.FormatInt(g.alloc, 10))
+				avails = append(avails, strconv.FormatInt(g.alloc-g.req, 10))
+			}
+
+			modelText := "-"
+			if len(gpuModels) > 0 {
+				modelText = strings.Join(gpuModels, ",")
+			}
+			modelCell := dim(modelText)
+			if modelText != "-" {
+				modelCell = cell{text: modelText, style: st}
+			}
+
+			row = append(row,
+				cell{text: strings.Join(types, ","), style: st},
+				plain(strings.Join(reqs, ",")),
+				plain(strings.Join(allocs, ",")),
+				plain(strings.Join(avails, ",")),
+				modelCell,
+			)
+		}
 	}
-	slices.Sort(names)
-	for _, name := range names {
-		parts = append(parts, fmt.Sprintf("%s %d/%d", acceleratorLabel(name), gpus[name].req, gpus[name].alloc))
+
+	pp, _ := pct(totalPodsReq, totalPodsAlloc)
+	row = append(row, levelCell(fmt.Sprintf("%d/%d", totalPodsReq, totalPodsAlloc), podsLevel(pp)))
+
+	if o.wide {
+		row = append(row,
+			dim("-"),
+			dim("-"),
+			dim("-"),
+			dim("-"),
+			dim("-"),
+			dim("-"),
+			dim("-"),
+			dim("-"),
+		)
 	}
-	return "Total: " + strings.Join(parts, " · ")
+
+	row = append(row, dim("-"))
+	return row
 }
 
 func ratio(a amount) float64 {
