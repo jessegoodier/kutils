@@ -188,6 +188,51 @@ func TestNodeHealth(t *testing.T) {
 	}
 }
 
+func TestReadinessConditions(t *testing.T) {
+	kinds := []corev1.NodeConditionType{"KernelReady", "StorageReady", "ContainerRuntimeReady", "NetworkingReady", "AcceleratedHardwareReady"}
+	n := corev1.Node{Status: corev1.NodeStatus{Conditions: []corev1.NodeCondition{cond(corev1.NodeReady, corev1.ConditionTrue)}}}
+	for _, kind := range kinds {
+		n.Status.Conditions = append(n.Status.Conditions, cond(kind, corev1.ConditionTrue))
+	}
+	check := func(want string) {
+		t.Helper()
+		ni := buildNodeInfo(&n, nil, nil, "")
+		got := statusCell(ni)
+		if got.text != want {
+			t.Fatalf("status = %q, want %q", got.text, want)
+		}
+		if want == "Healthy" && got.style.String() != styleOK.String() {
+			t.Error("all readiness checks passing should be green")
+		}
+	}
+	check("Healthy")
+	for i, kind := range kinds {
+		for _, state := range []corev1.ConditionStatus{corev1.ConditionFalse, corev1.ConditionUnknown} {
+			n.Status.Conditions[i+1].Status = state
+			if conditionHealthy(n.Status.Conditions[i+1]) {
+				t.Errorf("%s=%s should not be healthy", kind, state)
+			}
+			check(string(kind) + "=" + string(state))
+		}
+		n.Status.Conditions[i+1].Status = corev1.ConditionTrue
+		if !conditionHealthy(n.Status.Conditions[i+1]) {
+			t.Errorf("%s=True should be healthy", kind)
+		}
+	}
+	check("Healthy")
+}
+
+func TestPercentageFormatting(t *testing.T) {
+	got, p, ok := valueWithPct(corev1.ResourceMemory, 512<<20, 2<<30)
+	if got != "25%: 512M" || p != 25 || !ok {
+		t.Errorf("valueWithPct = %q, %d, %v", got, p, ok)
+	}
+	got, _, ok = valueWithPct(corev1.ResourceMemory, 512<<20, 0)
+	if got != "512M" || ok {
+		t.Errorf("unknown percentage = %q, %v", got, ok)
+	}
+}
+
 func TestNodeHealthDescribesWhy(t *testing.T) {
 	n := corev1.Node{Status: corev1.NodeStatus{Conditions: []corev1.NodeCondition{{
 		Type: corev1.NodeReady, Status: corev1.ConditionFalse,
@@ -238,7 +283,7 @@ func TestFormatting(t *testing.T) {
 			t.Errorf("fmtCPU(%d) = %q, want %q", in, got, want)
 		}
 	}
-	mem := map[int64]string{0: "0", 512: "512", 2048: "2Ki", 512 << 20: "512Mi", 30 << 30: "30Gi", 32315650048: "30.1Gi", 2 << 40: "2Ti"}
+	mem := map[int64]string{0: "0", 512: "512", 2048: "2K", 512 << 20: "512M", 30 << 30: "30G", 32315650048: "30.1G", 2 << 40: "2T"}
 	for in, want := range mem {
 		if got := fmtBytes(in); got != want {
 			t.Errorf("fmtBytes(%d) = %q, want %q", in, got, want)
@@ -284,6 +329,56 @@ func TestAccelerators(t *testing.T) {
 		if isAccelerator(name) {
 			t.Errorf("isAccelerator(%q) = true", name)
 		}
+	}
+}
+
+func TestGPUModelFallback(t *testing.T) {
+	tests := []struct {
+		name, provider, instanceType, want string
+		labels                             map[string]string
+	}{
+		{name: "current fractional GPU node", provider: "aws:///us-east-2a/i-example", instanceType: "g6f.xlarge", want: "NVIDIA-L4"},
+		{name: "full L4", provider: "aws:///us-east-2a/i-example", instanceType: "g6.xlarge", want: "NVIDIA-L4"},
+		{name: "different G6 variant", provider: "aws:///us-east-2a/i-example", instanceType: "g6e.xlarge", want: "NVIDIA-L40S"},
+		{name: "P5", provider: "aws:///us-east-2a/i-example", instanceType: "p5.48xlarge", want: "NVIDIA-H100"},
+		{name: "P5 enhanced", provider: "aws:///us-east-2a/i-example", instanceType: "p5en.48xlarge", want: "NVIDIA-H200"},
+		{name: "GB200 system physical GPU", provider: "aws:///us-east-2a/i-example", instanceType: "p6e-gb200.36xlarge", want: "NVIDIA-B200"},
+		{name: "AMD GPU", provider: "aws:///us-east-2a/i-example", instanceType: "g4ad.xlarge", want: "AMD-Radeon-Pro-V520"},
+		{name: "CPU node", provider: "aws:///us-east-2a/i-example", instanceType: "m7a.2xlarge"},
+		{name: "unknown family", provider: "aws:///us-east-2a/i-example", instanceType: "g99.xlarge"},
+		{name: "missing size", provider: "aws:///us-east-2a/i-example", instanceType: "g6f."},
+		{name: "missing dot", provider: "aws:///us-east-2a/i-example", instanceType: "g6f"},
+		{name: "non-AWS", provider: "gce://project/zone/node", instanceType: "g6f.xlarge"},
+		{name: "unidentified provider", instanceType: "g6f.xlarge"},
+		{name: "explicit model takes priority", provider: "aws:///us-east-2a/i-example", instanceType: "g6f.xlarge", labels: map[string]string{"nvidia.com/gpu.product": "NVIDIA-L4-vGPU"}, want: "NVIDIA-L4-vGPU"},
+		{name: "explicit model without AWS", labels: map[string]string{"cloud.google.com/gke-accelerator": "nvidia-l4"}, want: "nvidia-l4"},
+		{name: "legacy instance type", provider: "aws:///us-east-2a/i-example", labels: map[string]string{"beta.kubernetes.io/instance-type": "g6f.xlarge"}, want: "NVIDIA-L4"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			n := testNode("gpu-node", rl("nvidia.com/gpu", "1"), tt.labels)
+			n.Spec.ProviderID = tt.provider
+			if n.Labels == nil {
+				n.Labels = map[string]string{}
+			}
+			if tt.instanceType != "" {
+				n.Labels["node.kubernetes.io/instance-type"] = tt.instanceType
+			}
+			ni := buildNodeInfo(&n, nil, nil, "")
+			if ni.gpuModel != tt.want {
+				t.Fatalf("model = %q, want %q", ni.gpuModel, tt.want)
+			}
+			for _, wide := range []bool{false, true} {
+				headers, rows := buildTable([]*nodeInfo{ni}, tableOpts{wide: wide, showGPU: true}, time.Now())
+				got := rows[0][slices.Index(headers, "GPU MODEL")].text
+				if got != orDash(tt.want) {
+					t.Errorf("GPU MODEL cell = %q, want %q", got, orDash(tt.want))
+				}
+			}
+			if tt.name == "current fractional GPU node" && (ni.accels[0].alloc != 1 || ni.accels[0].capacity != 1) {
+				t.Error("inferring the physical model must preserve the device plugin's schedulable count")
+			}
+		})
 	}
 }
 
@@ -336,6 +431,48 @@ func TestCloudMetadata(t *testing.T) {
 	for _, tt := range tests {
 		if got := cloudMetadata(tt.labels); got != tt.want {
 			t.Errorf("cloudMetadata(%v) = %+v, want %+v", tt.labels, got, tt.want)
+		}
+	}
+}
+
+func TestNodeGroupLabels(t *testing.T) {
+	keys := []string{
+		"karpenter.sh/nodepool", "eks.amazonaws.com/nodegroup", "alpha.eksctl.io/nodegroup-name",
+		"cloud.google.com/gke-nodepool", "kubernetes.azure.com/agentpool", "agentpool",
+		"doks.digitalocean.com/node-pool", "ibm-cloud.kubernetes.io/worker-pool-name",
+		"k8s.scaleway.com/pool-name", "doks.digitalocean.com/node-pool-id", "k8s.scaleway.com/pool",
+		"node.kubernetes.io/pool", "kubernetes.io/nodegroup", "nodegroup", "nodepool",
+	}
+	for _, key := range keys {
+		t.Run(key, func(t *testing.T) {
+			labels := map[string]string{key: "workers"}
+			ni := buildNodeInfo(&corev1.Node{ObjectMeta: metav1.ObjectMeta{Labels: labels}}, nil, nil, "")
+			headers, rows := buildTable([]*nodeInfo{ni}, tableOpts{wide: true}, time.Now())
+			if headers[len(headers)-1] != "NODE GROUP" || rows[0][len(headers)-1].text != "workers" {
+				t.Errorf("node group should be the final column: %v, %v", headers, rows[0])
+			}
+			if slices.Contains(headers, "POOL") {
+				t.Error("node group should not also appear in a POOL column")
+			}
+		})
+	}
+	for _, labels := range []map[string]string{
+		nil, {"unrelated": "workers"}, {"nodegroup": ""},
+	} {
+		ni := buildNodeInfo(&corev1.Node{ObjectMeta: metav1.ObjectMeta{Labels: labels}}, nil, nil, "")
+		headers, rows := buildTable([]*nodeInfo{ni}, tableOpts{wide: true}, time.Now())
+		if rows[0][len(headers)-1].text != "-" {
+			t.Error("missing node group should display a dash")
+		}
+	}
+	for _, labels := range []map[string]string{
+		{"karpenter.sh/nodepool": "workers", "eks.amazonaws.com/nodegroup": "other", "nodegroup": "custom"},
+		{"doks.digitalocean.com/node-pool": "workers", "doks.digitalocean.com/node-pool-id": "123", "nodegroup": "custom"},
+		{"k8s.scaleway.com/pool-name": "workers", "k8s.scaleway.com/pool": "123"},
+		{"eks.amazonaws.com/nodegroup": "", "nodegroup": "workers"},
+	} {
+		if got := nodeGroup(labels); got != "workers" {
+			t.Errorf("label precedence: got %q, want workers", got)
 		}
 	}
 }
@@ -420,10 +557,11 @@ func TestBuildInfos(t *testing.T) {
 
 func TestBuildTable(t *testing.T) {
 	infos := buildInfos(testSnapshot())
+	infos[0].cloud.pool = "workers"
 	now := time.Now()
 
 	headers, rows := buildTable(infos, tableOpts{hasMetrics: true, showGPU: true}, now)
-	want := []string{"NAME", "STATUS", "ROLES", "CPU REQ", "CPU USE", "MEM REQ", "MEM USE", "GPU", "PODS", "AGE", "VERSION"}
+	want := []string{"NAME", "CPU REQ", "CPU USE", "MEM REQ", "MEM USE", "GPU TYPE", "GPU REQ", "GPU ALLOC", "GPU AVAIL", "GPU MODEL", "PODS", "NODE GROUP"}
 	if !slices.Equal(headers, want) {
 		t.Fatalf("headers = %v", headers)
 	}
@@ -435,14 +573,14 @@ func TestBuildTable(t *testing.T) {
 		return out
 	}
 	r0 := texts(rows[0])
-	if r0[3] != "1.5/4 (38%)" || r0[4] != "95%" || r0[5] != "4Gi/16Gi (25%)" || r0[7] != "-" || r0[8] != "2/110" {
+	if r0[1] != "38%: 1.5/4" || r0[2] != "95%" || r0[3] != "25%: 4G/16G" || r0[5] != "-" || r0[10] != "2/110" || r0[11] != "workers" {
 		t.Errorf("row 0 = %v", r0)
 	}
-	if rows[0][4].style.String() != styleWarn.String() {
+	if rows[0][2].style.String() != percentageStyle(95).String() {
 		t.Error("95% usage should be yellow")
 	}
 	r1 := texts(rows[1])
-	if r1[4] != "-" || r1[7] != "2/4 nvidia" {
+	if r1[2] != "-" || r1[5] != "nvidia" || r1[6] != "2" || r1[7] != "4" || r1[8] != "2" || r1[9] != "NVIDIA-A10G" || r1[11] != "-" {
 		t.Errorf("row 1 = %v", r1)
 	}
 
@@ -457,8 +595,163 @@ func TestBuildTable(t *testing.T) {
 	}
 
 	headers, _ = buildTable(infos[:1], tableOpts{}, now)
-	if slices.Contains(headers, "GPU") {
-		t.Errorf("GPU column should be hidden without accelerators: %v", headers)
+	for _, h := range headers {
+		if strings.HasPrefix(h, "GPU") {
+			t.Errorf("GPU columns should be hidden without accelerators: %v", headers)
+		}
+	}
+}
+
+func TestTableHealthStatus(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(*corev1.Node)
+		want   string
+		levels []level
+	}{
+		{name: "healthy", want: "Healthy"},
+		{
+			name:   "cordoned but ready",
+			mutate: func(n *corev1.Node) { n.Spec.Unschedulable = true },
+			want:   "SchedulingDisabled", levels: []level{lvlWarn},
+		},
+		{
+			name: "mixed critical and warning",
+			mutate: func(n *corev1.Node) {
+				n.Status.Conditions[0].Status = corev1.ConditionFalse
+				n.Spec.Unschedulable = true
+				n.Status.Conditions = append(n.Status.Conditions, cond(corev1.NodeMemoryPressure, corev1.ConditionTrue))
+			},
+			want: "NotReady,SchedulingDisabled,MemoryPressure", levels: []level{lvlCrit, lvlWarn, lvlWarn},
+		},
+		{
+			name: "taint on ready node",
+			mutate: func(n *corev1.Node) {
+				n.Spec.Taints = []corev1.Taint{{Key: "node.kubernetes.io/unreachable", Effect: corev1.TaintEffectNoExecute}}
+			},
+			want: "node.kubernetes.io/unreachable", levels: []level{lvlCrit},
+		},
+		{
+			name:   "missing GPUs",
+			mutate: func(n *corev1.Node) { n.Labels = map[string]string{"nvidia.com/gpu.count": "4"} },
+			want:   "GPUsMissing", levels: []level{lvlWarn},
+		},
+		{
+			name: "unhealthy GPUs",
+			mutate: func(n *corev1.Node) {
+				n.Status.Capacity = rl("nvidia.com/gpu", "4")
+				n.Status.Allocatable = rl("nvidia.com/gpu", "2")
+			},
+			want: "nvidia.com/gpuUnhealthy", levels: []level{lvlWarn},
+		},
+		{
+			name:   "version skew",
+			mutate: func(n *corev1.Node) { n.Status.NodeInfo.KubeletVersion = "v1.35.0" },
+			want:   "KubeletSkew", levels: []level{lvlWarn},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			n := &corev1.Node{Status: corev1.NodeStatus{
+				Conditions: []corev1.NodeCondition{cond(corev1.NodeReady, corev1.ConditionTrue)},
+				NodeInfo:   corev1.NodeSystemInfo{KubeletVersion: "v1.36.0"},
+			}}
+			if tt.mutate != nil {
+				tt.mutate(n)
+			}
+			ni := buildNodeInfo(n, nil, nil, "v1.36.0")
+			for _, wide := range []bool{false, true} {
+				headers, rows := buildTable([]*nodeInfo{ni}, tableOpts{wide: wide}, time.Now())
+				if !wide {
+					for _, h := range []string{"AGE", "VERSION", "STATUS", "ROLES"} {
+						if slices.Contains(headers, h) {
+							t.Errorf("compact output should hide %s", h)
+						}
+					}
+					if len(rows[0]) != len(headers) {
+						t.Errorf("compact row has %d cells, want %d", len(rows[0]), len(headers))
+					}
+					continue
+				}
+				if !slices.Equal(headers[len(headers)-5:], []string{"AGE", "VERSION", "STATUS", "ROLES", "NODE GROUP"}) {
+					t.Fatalf("last columns = %v", headers)
+				}
+				if rows[0][len(headers)-2].text != ni.roles {
+					t.Error("penultimate cell should contain node roles")
+				}
+				got := rows[0][len(headers)-3]
+				if got.text != tt.want || len(got.parts) != len(tt.levels) {
+					t.Fatalf("status = %+v, want %q with %d problems", got, tt.want, len(tt.levels))
+				}
+				if len(tt.levels) == 0 && got.style.String() != styleOK.String() {
+					t.Error("healthy status should be green")
+				}
+				for i, lvl := range tt.levels {
+					if got.parts[i].style.String() != lvl.style().String() {
+						t.Errorf("problem %d has wrong severity color", i)
+					}
+				}
+			}
+		})
+	}
+}
+
+func TestPercentageColorBands(t *testing.T) {
+	previous := color.ForceSetColorLevel(color.Level256)
+	defer color.ForceSetColorLevel(previous)
+	for _, tt := range []struct {
+		p    int
+		code uint8
+	}{
+		{0, 75}, {39, 75}, {40, 45}, {60, 45}, {61, 84},
+		{80, 84}, {81, 220}, {95, 220}, {96, 203}, {150, 203},
+	} {
+		if got := percentageStyle(tt.p).String(); got != color.C256(tt.code).String() {
+			t.Errorf("%d%% color = %q, want %q", tt.p, got, color.C256(tt.code).String())
+		}
+	}
+	color.ForceSetColorLevel(color.Level16)
+	if percentageStyle(95).String() != styleWarn.String() || percentageStyle(96).String() != styleBad.String() {
+		t.Error("basic terminal must retain yellow/red problem colors")
+	}
+}
+
+func TestPercentageCellRendering(t *testing.T) {
+	c := percentageCell("81%: 13.5G/16.7G", 81, true)
+	if len(c.parts) != 2 || c.parts[0].text != "81%" || c.parts[1].text != ": 13.5G/16.7G" || c.parts[1].style.String() != stylePlain.String() {
+		t.Fatalf("percentage and quantities should have separate styles: %+v", c)
+	}
+	var buf bytes.Buffer
+	printTable(&buf, "", []string{"MEM REQ", "NEXT"}, [][]cell{{c, plain("x")}})
+	lines := strings.Split(strings.TrimSpace(buf.String()), "\n")
+	if !strings.Contains(lines[1], c.text) || strings.Index(lines[0], "NEXT") != strings.Index(lines[1], "x") {
+		t.Fatalf("percentage text or alignment changed: %q", buf.String())
+	}
+	unknown := percentageCell("512M", 0, false)
+	if unknown.style.String() != stylePlain.String() || len(unknown.parts) != 0 {
+		t.Error("unknown percentage should not get a scale color")
+	}
+}
+
+func TestPrintTableMixedStatusColors(t *testing.T) {
+	status := statusCell(&nodeInfo{issues: []issue{
+		{lvlCrit, "not ready", "NotReady"},
+		{lvlWarn, "cordoned", "SchedulingDisabled"},
+	}})
+	var buf bytes.Buffer
+	printTable(&buf, "", []string{"STATUS", "NEXT"}, [][]cell{{status, plain("x")}})
+	lines := strings.Split(strings.TrimSpace(buf.String()), "\n")
+	if !strings.Contains(lines[1], "NotReady,SchedulingDisabled") || strings.Index(lines[0], "NEXT") != strings.Index(lines[1], "x") {
+		t.Fatalf("plain status text or alignment incorrect: %q", buf.String())
+	}
+	previous := color.Enable
+	color.Enable = true
+	defer func() { color.Enable = previous }()
+	buf.Reset()
+	printTable(&buf, "", []string{"STATUS"}, [][]cell{{status}})
+	want := styleBad.Sprint("NotReady") + "," + styleWarn.Sprint("SchedulingDisabled")
+	if !strings.Contains(buf.String(), want) {
+		t.Errorf("status colors = %q, want %q", buf.String(), want)
 	}
 }
 
@@ -474,9 +767,9 @@ func TestPrintTableAligns(t *testing.T) {
 func TestSummary(t *testing.T) {
 	infos := buildInfos(testSnapshot())
 	infos[0].node.Spec.Unschedulable = true
-	infos[0].issues = append(infos[0].issues, issue{lvlWarn, "cordoned"})
+	infos[0].issues = append(infos[0].issues, issue{lvlWarn, "cordoned", "SchedulingDisabled"})
 	got := summary(infos, tableOpts{})
-	for _, want := range []string{"2 nodes (1 cordoned, 1 with issues)", "CPU 3.5/12 requested (29%)", "nvidia 2/4"} {
+	for _, want := range []string{"2 nodes (1 cordoned, 1 with issues)", "CPU 29%: 3.5/12 requested", "nvidia 2/4"} {
 		if !strings.Contains(got, want) {
 			t.Errorf("summary %q missing %q", got, want)
 		}
@@ -496,6 +789,98 @@ func TestSortInfos(t *testing.T) {
 	sortInfos(infos, "name")
 	if infos[0].node.Name != "cpu-1" {
 		t.Errorf("name sort: first = %s", infos[0].node.Name)
+	}
+}
+
+func TestDefaultSortByNodeGroup(t *testing.T) {
+	infos := []*nodeInfo{
+		{node: &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "node-a"}}, cloud: cloudInfo{pool: "beta"}},
+		{node: &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "node-z"}}, cloud: cloudInfo{pool: "alpha"}},
+		{node: &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "node-b"}}, cloud: cloudInfo{pool: "alpha"}},
+		{node: &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "node-c"}}},
+	}
+	sortInfos(infos, defaultSort)
+	want := []string{"node-c", "node-b", "node-z", "node-a"}
+	for i, ni := range infos {
+		if ni.node.Name != want[i] {
+			t.Errorf("sorted node %d = %s, want %s", i, ni.node.Name, want[i])
+		}
+	}
+	sortInfos(infos, "name")
+	want = []string{"node-a", "node-b", "node-c", "node-z"}
+	for i, ni := range infos {
+		if ni.node.Name != want[i] {
+			t.Errorf("explicit name sort %d = %s, want %s", i, ni.node.Name, want[i])
+		}
+	}
+}
+
+func TestNodeGroupColorsAcrossSortAndFilter(t *testing.T) {
+	node := func(name, group string) *nodeInfo {
+		n := testNode(name, nil, map[string]string{"nodegroup": group})
+		return buildNodeInfo(&n, nil, nil, "")
+	}
+	infos := []*nodeInfo{node("node-z", "alpha"), node("node-b", "beta"), node("node-a", "alpha"), node("node-c", "")}
+	styles := map[string]string{}
+	for _, by := range []string{defaultSort, "name"} {
+		sortInfos(infos, by)
+		headers, rows := buildTable(infos, tableOpts{wide: true}, time.Now())
+		for i, row := range rows {
+			group := infos[i].cloud.pool
+			c := row[len(headers)-1]
+			if previous, ok := styles[group]; ok && previous != c.style.String() {
+				t.Errorf("group %q changed color", group)
+			}
+			styles[group] = c.style.String()
+			if group != "" && row[0].style.String() != c.style.String() {
+				t.Error("node name should match its group color")
+			}
+			if group == "" && (c.text != "-" || c.style.String() != styleMeta.String()) {
+				t.Error("unknown group should be a dim dash")
+			}
+		}
+	}
+	if styles["alpha"] == styles["beta"] {
+		t.Error("example groups should have different palette colors")
+	}
+	headers, rows := buildTable(infos[:1], tableOpts{wide: true}, time.Now())
+	if rows[0][len(headers)-1].style.String() != styles[infos[0].cloud.pool] {
+		t.Error("filtering changed the group color")
+	}
+	var buf bytes.Buffer
+	printTable(&buf, "", headers, rows)
+	if strings.Contains(buf.String(), "\x1b[") || !strings.Contains(buf.String(), infos[0].cloud.pool) {
+		t.Error("color-disabled output should retain plain group text")
+	}
+}
+
+func TestExpandedGroupColors(t *testing.T) {
+	previous := color.ForceSetColorLevel(color.Level256)
+	defer color.ForceSetColorLevel(previous)
+	groups := []string{"clickhouse-m7a-2xl-2a", "gpu-g6f-xlarge", "main-m7a-2xlarge", "nat-gateway-nodes", "r7a-4xl-2a"}
+	seen := map[string]string{}
+	for _, group := range groups {
+		n := testNode("node-1", nil, map[string]string{"nodegroup": group})
+		ni := buildNodeInfo(&n, nil, nil, "")
+		headers, rows := buildTable([]*nodeInfo{ni}, tableOpts{}, time.Now())
+		nameCell, groupCell := rows[0][0], rows[0][len(headers)-1]
+		code := groupCell.style.String()
+		if !strings.HasPrefix(code, "38;5;") || nameCell.style.String() != code {
+			t.Errorf("node and group should share a 256-color style: %q / %q", nameCell.style.String(), code)
+		}
+		if other, ok := seen[code]; ok {
+			t.Errorf("example groups %q and %q share a color", other, group)
+		}
+		seen[code] = group
+		var buf bytes.Buffer
+		printTable(&buf, "", headers, rows)
+		if strings.Contains(buf.String(), "\x1b[") {
+			t.Error("disabled colors should suppress 256-color escapes")
+		}
+	}
+	color.ForceSetColorLevel(color.Level16)
+	if code := nodeGroupCell(groups[0]).style.String(); strings.Contains(code, "38;5;") {
+		t.Error("16-color terminal should use the basic palette")
 	}
 }
 
@@ -599,7 +984,7 @@ func TestComplete(t *testing.T) {
 		{[]string{""}, []string{"gpu-1", "node-a", "node-b"}},
 		{[]string{"node"}, []string{"node-a", "node-b"}},
 		{[]string{"node-a", "node"}, []string{"node-b"}},
-		{[]string{"--sort", ""}, []string{"age", "cpu", "gpu", "mem", "name", "pods"}},
+		{[]string{"--sort", ""}, []string{"age", "cpu", "gpu", "mem", "name", "nodegroup", "pods"}},
 		{[]string{"--sort=c"}, []string{"--sort=cpu"}},
 		{[]string{"-o", ""}, []string{"wide"}},
 		{[]string{"--kubeconfig", ""}, []string{completeFiles}},

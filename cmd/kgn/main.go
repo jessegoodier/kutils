@@ -7,6 +7,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"hash/fnv"
 	"io"
 	"math"
 	"os"
@@ -105,6 +106,7 @@ func (l level) marker() string {
 type issue struct {
 	level level
 	text  string
+	label string // concise table status; text retains the detailed explanation
 }
 
 // amount holds one resource's numbers for a node. CPU is in millicores, every
@@ -150,7 +152,9 @@ func (ni *nodeInfo) get(name corev1.ResourceName) amount {
 // Flags and usage
 // ---------------------------------------------------------------------------
 
-var sortKeys = []string{"name", "cpu", "mem", "gpu", "pods", "age"}
+const defaultSort = "nodegroup"
+
+var sortKeys = []string{"nodegroup", "name", "cpu", "mem", "gpu", "pods", "age"}
 
 func printUsage() {
 	fmt.Println(styleTitle.Sprint("Kubernetes Get Nodes (kgn)"))
@@ -180,7 +184,7 @@ func printUsage() {
 	row("-d, --detail", "", "Show why a node is unhealthy plus conditions, taints, resources, events.", "")
 	row("-u, --unhealthy", "", "Only show nodes with a health problem.", "")
 	row("-o, --output", "format", "Output format: wide (split resource columns, cloud info).", "")
-	row("--sort", "key", "Sort by "+strings.Join(sortKeys, ", ")+" (cpu/mem/gpu/pods: highest first).", "name")
+	row("--sort", "key", "Sort by "+strings.Join(sortKeys, ", ")+" (nodegroup: group then name; cpu/mem/gpu/pods: highest first).", defaultSort)
 	row("--no-color", "", "Disable colored output (NO_COLOR is also honored).", "")
 	row("--kubeconfig", "path", "Path to kubeconfig file.", "$KUBECONFIG or ~/.kube/config")
 	row("--completions", "shell", "Print shell completion script (bash or zsh).", "")
@@ -243,7 +247,7 @@ func main() {
 	fs := flag.NewFlagSet("kgn", flag.ContinueOnError)
 	selector := stringFlag(fs, "l", "selector", "")
 	output := stringFlag(fs, "o", "output", "")
-	sortBy := fs.String("sort", "name", "")
+	sortBy := fs.String("sort", defaultSort, "")
 	detail := boolFlag(fs, "d", "detail")
 	unhealthy := boolFlag(fs, "u", "unhealthy")
 	noColor := boolFlag(fs, "", "no-color")
@@ -551,14 +555,14 @@ func buildNodeInfo(n *corev1.Node, pods []*corev1.Pod, usage corev1.ResourceList
 		}
 	}
 	slices.SortFunc(ni.accels, func(a, b accel) int { return cmp.Compare(a.name, b.name) })
-	ni.gpuModel = gpuModel(n.Labels)
+	ni.gpuModel = gpuModel(n)
 	gpuIssues := acceleratorHealth(n.Labels, ni.accels)
 	ni.gpuLevel = worstLevel(gpuIssues)
 	issues = append(issues, gpuIssues...)
 
 	if lvl, msg := kubeletSkew(n.Status.NodeInfo.KubeletVersion, refVersion); lvl != lvlOK {
 		ni.versionLevel = lvl
-		issues = append(issues, issue{lvl, msg})
+		issues = append(issues, issue{lvl, msg, "KubeletSkew"})
 	}
 
 	ni.issues = issues
@@ -639,11 +643,10 @@ func findCondition(n *corev1.Node, t corev1.NodeConditionType) *corev1.NodeCondi
 	return nil
 }
 
-// conditionHealthy reports whether a condition is in its good state: Ready
-// is healthy when True, everything else (pressure conditions and
-// node-problem-detector style conditions) when False.
+// conditionHealthy treats readiness conditions (Ready, KernelReady, etc.)
+// as healthy when True; pressure and problem conditions are healthy when False.
 func conditionHealthy(c corev1.NodeCondition) bool {
-	if c.Type == corev1.NodeReady {
+	if strings.HasSuffix(string(c.Type), "Ready") {
 		return c.Status == corev1.ConditionTrue
 	}
 	return c.Status == corev1.ConditionFalse
@@ -671,53 +674,59 @@ func nodeHealth(n *corev1.Node) (string, []issue) {
 	ready := "Unknown"
 	switch c := findCondition(n, corev1.NodeReady); {
 	case c == nil:
-		issues = append(issues, issue{lvlCrit, "Unknown: kubelet has never reported a Ready condition"})
+		issues = append(issues, issue{lvlCrit, "Unknown: kubelet has never reported a Ready condition", "Unknown"})
 	case c.Status == corev1.ConditionTrue:
 		ready = "Ready"
 	case c.Status == corev1.ConditionFalse:
 		ready = "NotReady"
-		issues = append(issues, issue{lvlCrit, describeCondition("NotReady", c)})
+		issues = append(issues, issue{lvlCrit, describeCondition("NotReady", c), "NotReady"})
 	default:
-		issues = append(issues, issue{lvlCrit, describeCondition("Unknown: kubelet stopped posting node status", c)})
+		issues = append(issues, issue{lvlCrit, describeCondition("Unknown: kubelet stopped posting node status", c), "Unknown"})
 	}
 	parts := []string{ready}
 
 	if n.Spec.Unschedulable {
 		parts = append(parts, "SchedulingDisabled")
-		issues = append(issues, issue{lvlWarn, "cordoned: new pods will not be scheduled (kubectl uncordon to undo)"})
+		issues = append(issues, issue{lvlWarn, "cordoned: new pods will not be scheduled (kubectl uncordon to undo)", "SchedulingDisabled"})
 	}
 	if n.DeletionTimestamp != nil {
 		parts = append(parts, "Terminating")
-		issues = append(issues, issue{lvlWarn, "node object is being deleted"})
+		issues = append(issues, issue{lvlWarn, "node object is being deleted", "Terminating"})
 	}
 
-	// Only flag pressure conditions while the kubelet is reporting; once
-	// Ready is Unknown they all go Unknown and add nothing.
+	// Ready-suffixed conditions are positive checks. Preserve the existing
+	// behavior of ignoring Unknown pressure/problem conditions when a kubelet
+	// stops reporting, but flag False or Unknown readiness checks.
 	for i := range n.Status.Conditions {
 		c := &n.Status.Conditions[i]
-		if c.Type == corev1.NodeReady || c.Status != corev1.ConditionTrue {
+		readiness := strings.HasSuffix(string(c.Type), "Ready")
+		if c.Type == corev1.NodeReady || conditionHealthy(*c) || (!readiness && c.Status != corev1.ConditionTrue) {
 			continue
 		}
-		parts = append(parts, string(c.Type))
+		label := string(c.Type)
+		if readiness {
+			label += "=" + string(c.Status)
+		}
+		parts = append(parts, label)
 		lvl := lvlWarn
 		if c.Type == corev1.NodeNetworkUnavailable {
 			lvl = lvlCrit // pod networking is not configured; pods can't run
 		}
-		issues = append(issues, issue{lvl, describeCondition(string(c.Type), c)})
+		issues = append(issues, issue{lvl, describeCondition(label, c), label})
 	}
 
 	for _, t := range n.Spec.Taints {
 		switch t.Key {
 		case "node.kubernetes.io/unreachable":
-			issues = append(issues, issue{lvlCrit, "taint " + t.Key + ":" + string(t.Effect) + ": node controller cannot reach the kubelet"})
+			issues = append(issues, issue{lvlCrit, "taint " + t.Key + ":" + string(t.Effect) + ": node controller cannot reach the kubelet", t.Key})
 		case "node.kubernetes.io/not-ready":
-			issues = append(issues, issue{lvlCrit, "taint " + t.Key + ":" + string(t.Effect) + ": node controller marked the node not ready"})
+			issues = append(issues, issue{lvlCrit, "taint " + t.Key + ":" + string(t.Effect) + ": node controller marked the node not ready", t.Key})
 		case "node.kubernetes.io/out-of-service":
-			issues = append(issues, issue{lvlCrit, "taint " + t.Key + ": node marked out of service, pods are being force-deleted"})
+			issues = append(issues, issue{lvlCrit, "taint " + t.Key + ": node marked out of service, pods are being force-deleted", t.Key})
 		case "ToBeDeletedByClusterAutoscaler":
-			issues = append(issues, issue{lvlWarn, "scheduled for removal by cluster-autoscaler"})
+			issues = append(issues, issue{lvlWarn, "scheduled for removal by cluster-autoscaler", t.Key})
 		case "karpenter.sh/disrupted", "karpenter.sh/disruption":
-			issues = append(issues, issue{lvlWarn, "being disrupted (drained/replaced) by Karpenter"})
+			issues = append(issues, issue{lvlWarn, "being disrupted (drained/replaced) by Karpenter", t.Key})
 		}
 	}
 	return strings.Join(parts, ","), issues
@@ -824,15 +833,64 @@ func acceleratorLabel(name corev1.ResourceName) string {
 	return s
 }
 
-func gpuModel(labels map[string]string) string {
-	return firstLabel(labels,
+func gpuModel(n *corev1.Node) string {
+	if model := firstLabel(n.Labels,
 		"nvidia.com/gpu.product",
 		"cloud.google.com/gke-accelerator",
 		"cloud.google.com/gke-tpu-accelerator",
 		"karpenter.k8s.aws/instance-gpu-name",
 		"amd.com/gpu.product-name",
 		"beta.amd.com/gpu.product-name",
-	)
+	); model != "" {
+		return model
+	}
+	// A generic instance-type label alone does not prove this is an EC2 node.
+	if !strings.HasPrefix(n.Spec.ProviderID, "aws://") {
+		return ""
+	}
+	instanceType := firstLabel(n.Labels, "node.kubernetes.io/instance-type", "beta.kubernetes.io/instance-type")
+	return ec2GPUModel(instanceType)
+}
+
+// ec2GPUModel infers the physical model, not the schedulable GPU count or
+// partition size. G6f/Gr6f expose fractional L4 devices as integer resources.
+// Verified against AWS's specifications in October 2026:
+// https://docs.aws.amazon.com/ec2/latest/instancetypes/ac.html
+func ec2GPUModel(instanceType string) string {
+	family, size, ok := strings.Cut(instanceType, ".")
+	if !ok || size == "" {
+		return ""
+	}
+	switch family {
+	case "g4ad":
+		return "AMD-Radeon-Pro-V520"
+	case "g4dn":
+		return "NVIDIA-T4"
+	case "g5":
+		return "NVIDIA-A10G"
+	case "g5g":
+		return "NVIDIA-T4g"
+	case "g6", "g6f", "gr6", "gr6f":
+		return "NVIDIA-L4"
+	case "g6e":
+		return "NVIDIA-L40S"
+	case "g7":
+		return "NVIDIA-RTX-PRO-4500"
+	case "g7e":
+		return "NVIDIA-RTX-PRO-Server-6000"
+	case "p4d", "p4de":
+		return "NVIDIA-A100"
+	case "p5":
+		return "NVIDIA-H100"
+	case "p5e", "p5en":
+		return "NVIDIA-H200"
+	case "p6-b200", "p6e-gb200":
+		return "NVIDIA-B200"
+	case "p6-b300":
+		return "NVIDIA-B300"
+	default:
+		return ""
+	}
 }
 
 // acceleratorHealth flags devices the device plugin reports as unhealthy
@@ -842,7 +900,7 @@ func acceleratorHealth(labels map[string]string, accels []accel) []issue {
 	var issues []issue
 	for _, a := range accels {
 		if a.capacity > a.alloc {
-			issues = append(issues, issue{lvlWarn, fmt.Sprintf("%d of %d %s not allocatable (device plugin reports them unhealthy)", a.capacity-a.alloc, a.capacity, a.name)})
+			issues = append(issues, issue{lvlWarn, fmt.Sprintf("%d of %d %s not allocatable (device plugin reports them unhealthy)", a.capacity-a.alloc, a.capacity, a.name), string(a.name) + "Unhealthy"})
 		}
 	}
 	if n, err := strconv.Atoi(labels["nvidia.com/gpu.count"]); err == nil && n > 0 {
@@ -850,7 +908,7 @@ func acceleratorHealth(labels map[string]string, accels []accel) []issue {
 			return strings.HasPrefix(string(a.name), "nvidia.com/") && a.capacity > 0
 		})
 		if !advertised {
-			issues = append(issues, issue{lvlWarn, fmt.Sprintf("node is labelled with %d NVIDIA GPU(s) but none are advertised (is the device plugin running?)", n)})
+			issues = append(issues, issue{lvlWarn, fmt.Sprintf("node is labelled with %d NVIDIA GPU(s) but none are advertised (is the device plugin running?)", n), "GPUsMissing"})
 		}
 	}
 	return issues
@@ -874,16 +932,57 @@ func cloudMetadata(labels map[string]string) cloudInfo {
 		instanceType: firstLabel(labels, "node.kubernetes.io/instance-type", "beta.kubernetes.io/instance-type"),
 		zone:         firstLabel(labels, "topology.kubernetes.io/zone", "failure-domain.beta.kubernetes.io/zone"),
 		capacityType: capacityType(labels),
-		pool: firstLabel(labels,
-			"karpenter.sh/nodepool",
-			"eks.amazonaws.com/nodegroup",
-			"alpha.eksctl.io/nodegroup-name",
-			"cloud.google.com/gke-nodepool",
-			"kubernetes.azure.com/agentpool",
-			"agentpool",
-			"node.kubernetes.io/pool",
-		),
+		pool:         nodeGroup(labels),
 	}
+}
+
+// nodeGroup prefers provider names, then provider IDs, then custom labels.
+// Kubernetes has no standard node-group label. Generic keys are conventions.
+func nodeGroup(labels map[string]string) string {
+	return firstLabel(labels,
+		"karpenter.sh/nodepool",
+		"eks.amazonaws.com/nodegroup",
+		"alpha.eksctl.io/nodegroup-name",
+		"cloud.google.com/gke-nodepool",
+		"kubernetes.azure.com/agentpool",
+		"agentpool",
+		"doks.digitalocean.com/node-pool",
+		"ibm-cloud.kubernetes.io/worker-pool-name",
+		"k8s.scaleway.com/pool-name",
+		"doks.digitalocean.com/node-pool-id",
+		"k8s.scaleway.com/pool",
+		"node.kubernetes.io/pool",
+		"kubernetes.io/nodegroup",
+		"nodegroup",
+		"nodepool", // OVHcloud also uses this unprefixed label.
+	)
+}
+
+// FNV keeps group colors stable across runs, filters, and sorting changes.
+// Cool hues distinguish groups without reusing warning yellow/critical red.
+var nodeGroupPalette = []uint8{
+	39, 81, 45, 75, 111, 141, 177, 213, 205,
+	99, 117, 147, 183, 219, 51, 105, 69, 171,
+}
+
+var nodeGroupBasicPalette = []color.Style{
+	{color.FgLightBlue}, {color.FgLightCyan}, {color.FgLightMagenta},
+	{color.FgBlue}, {color.FgCyan}, {color.FgMagenta},
+	{color.Bold, color.FgLightBlue}, {color.Bold, color.FgLightMagenta},
+}
+
+func nodeGroupCell(group string) cell {
+	if group == "" {
+		return dim("-")
+	}
+	h := fnv.New32a()
+	_, _ = h.Write([]byte(group))
+	if color.Support256Color() {
+		index := h.Sum32() % uint32(len(nodeGroupPalette))
+		return cell{text: group, style: color.C256(nodeGroupPalette[index])}
+	}
+	index := h.Sum32() % uint32(len(nodeGroupBasicPalette))
+	return cell{text: group, style: nodeGroupBasicPalette[index]}
 }
 
 func capacityType(labels map[string]string) string {
@@ -931,17 +1030,17 @@ func fmtCPU(milli int64) string {
 	}
 }
 
-// fmtBytes renders bytes with binary units: "30.1Gi", "512Mi".
+// fmtBytes uses binary sizes with compact suffixes: "30.1G", "512M".
 func fmtBytes(b int64) string {
 	units := []struct {
 		suffix string
 		size   float64
 		prec   int
 	}{
-		{"Ti", 1 << 40, 1},
-		{"Gi", 1 << 30, 1},
-		{"Mi", 1 << 20, 0},
-		{"Ki", 1 << 10, 0},
+		{"T", 1 << 40, 1},
+		{"G", 1 << 30, 1},
+		{"M", 1 << 20, 0},
+		{"K", 1 << 10, 0},
 	}
 	for _, u := range units {
 		if float64(b) >= u.size {
@@ -992,33 +1091,100 @@ func podsLevel(p int) level {
 	}
 }
 
-// valueWithPct renders "3.2 (41%)" or just "3.2" when the percentage is unknown.
+// valueWithPct renders "41%: 3.2" or just "3.2" when the percentage is unknown.
 func valueWithPct(name corev1.ResourceName, v, whole int64) (string, int, bool) {
 	p, ok := pct(v, whole)
 	if !ok {
 		return fmtAmount(name, v), 0, false
 	}
-	return fmt.Sprintf("%s (%d%%)", fmtAmount(name, v), p), p, true
+	return fmt.Sprintf("%d%%: %s", p, fmtAmount(name, v)), p, true
 }
 
 // ---------------------------------------------------------------------------
 // Table
 // ---------------------------------------------------------------------------
 
-type cell struct {
-	text  string
-	style color.Style
+type terminalStyle interface {
+	Sprint(...any) string
+	String() string
 }
 
-func plain(s string) cell { return cell{s, stylePlain} }
-func dim(s string) cell   { return cell{s, styleMeta} }
+type cell struct {
+	text      string
+	style     terminalStyle
+	parts     []cell // independently styled segments; text stays plain for alignment
+	separator string
+}
+
+func plain(s string) cell { return cell{text: s, style: stylePlain} }
+func dim(s string) cell   { return cell{text: s, style: styleMeta} }
 
 // levelCell colors healthy values white and problems yellow/red.
 func levelCell(s string, l level) cell {
 	if l == lvlOK {
 		return plain(s)
 	}
-	return cell{s, l.style()}
+	return cell{text: s, style: l.style()}
+}
+
+// percentageStyle uses the displayed whole-number percentage, so rounding
+// never produces a value whose color contradicts its visible band.
+func percentageStyle(p int) terminalStyle {
+	band := 0
+	switch {
+	case p > 95:
+		band = 4
+	case p > 80:
+		band = 3
+	case p > 60:
+		band = 2
+	case p >= 40:
+		band = 1
+	}
+	if color.Support256Color() {
+		palette := [...]uint8{75, 45, 84, 220, 203}
+		return color.C256(palette[band])
+	}
+	palette := [...]color.Style{
+		{color.FgLightBlue}, {color.FgLightCyan}, {color.FgLightGreen}, styleWarn, styleBad,
+	}
+	return palette[band]
+}
+
+// percentageCell colors only the percentage; quantities remain neutral.
+func percentageCell(s string, p int, known bool) cell {
+	if !known {
+		return plain(s)
+	}
+	st := percentageStyle(p)
+	percentage, values, hasValues := strings.Cut(s, ": ")
+	if !hasValues {
+		return cell{text: s, style: st}
+	}
+	return cell{text: s, style: stylePlain, parts: []cell{
+		{text: percentage, style: st}, plain(": " + values),
+	}}
+}
+
+// statusCell shows a single healthy label or only the failing health checks.
+func statusCell(ni *nodeInfo) cell {
+	var labels []string
+	var parts []cell
+	for _, is := range ni.issues {
+		if is.level == lvlOK {
+			continue
+		}
+		label := is.label
+		if label == "" {
+			label = is.text
+		}
+		labels = append(labels, label)
+		parts = append(parts, cell{text: label, style: is.level.style()})
+	}
+	if len(parts) == 0 {
+		return cell{text: "Healthy", style: styleOK}
+	}
+	return cell{text: strings.Join(labels, ","), style: stylePlain, parts: parts, separator: ","}
 }
 
 func orDash(s string) string {
@@ -1033,7 +1199,7 @@ type tableOpts struct {
 }
 
 func buildTable(infos []*nodeInfo, o tableOpts, now time.Time) ([]string, [][]cell) {
-	headers := []string{"NAME", "STATUS", "ROLES"}
+	headers := []string{"NAME"}
 	for _, label := range []string{"CPU", "MEM"} {
 		if o.wide {
 			headers = append(headers, label+" REQ", label+" LIM", label+" ALLOC", label+" AVAIL")
@@ -1045,46 +1211,42 @@ func buildTable(infos []*nodeInfo, o tableOpts, now time.Time) ([]string, [][]ce
 		}
 	}
 	if o.showGPU {
-		if o.wide {
-			headers = append(headers, "GPU TYPE", "GPU REQ", "GPU ALLOC", "GPU AVAIL", "GPU MODEL")
-		} else {
-			headers = append(headers, "GPU")
-		}
+		headers = append(headers, "GPU TYPE", "GPU REQ", "GPU ALLOC", "GPU AVAIL", "GPU MODEL")
 	}
 	headers = append(headers, "PODS")
 	if o.wide {
-		headers = append(headers, "INSTANCE", "CAPACITY", "ZONE", "POOL", "INTERNAL-IP")
+		headers = append(headers, "INSTANCE", "CAPACITY", "ZONE", "INTERNAL-IP", "AGE", "VERSION", "STATUS", "ROLES")
 	}
-	headers = append(headers, "AGE", "VERSION")
+	headers = append(headers, "NODE GROUP")
 
 	rows := make([][]cell, 0, len(infos))
 	for _, ni := range infos {
-		row := []cell{
-			plain(ni.node.Name),
-			{ni.status, ni.statusLevel.style()},
-			dim(ni.roles),
+		nameCell := plain(ni.node.Name)
+		if ni.cloud.pool != "" {
+			nameCell.style = nodeGroupCell(ni.cloud.pool).style
 		}
+		row := []cell{nameCell}
 		for _, name := range []corev1.ResourceName{corev1.ResourceCPU, corev1.ResourceMemory} {
 			a := ni.get(name)
 			if o.wide {
-				req, p, _ := valueWithPct(name, a.req, a.alloc)
-				lim, _, _ := valueWithPct(name, a.lim, a.alloc)
+				req, p, known := valueWithPct(name, a.req, a.alloc)
+				lim, lp, limKnown := valueWithPct(name, a.lim, a.alloc)
 				row = append(row,
-					levelCell(req, pctLevel(p)),
-					dim(lim),
+					percentageCell(req, p, known),
+					percentageCell(lim, lp, limKnown),
 					plain(fmtAmount(name, a.alloc)),
 					plain(fmtAmount(name, a.avail())),
 				)
 			} else {
-				p, _ := pct(a.req, a.alloc)
-				row = append(row, levelCell(fmt.Sprintf("%s/%s (%d%%)", fmtAmount(name, a.req), fmtAmount(name, a.alloc), p), pctLevel(p)))
+				p, known := pct(a.req, a.alloc)
+				row = append(row, percentageCell(fmt.Sprintf("%d%%: %s/%s", p, fmtAmount(name, a.req), fmtAmount(name, a.alloc)), p, known))
 			}
 			if o.hasMetrics {
 				row = append(row, usageCell(name, a, o.wide))
 			}
 		}
 		if o.showGPU {
-			row = append(row, gpuCells(ni, o.wide)...)
+			row = append(row, gpuCells(ni)...)
 		}
 		pods := ni.get(corev1.ResourcePods)
 		pp, _ := pct(pods.req, pods.alloc)
@@ -1094,14 +1256,14 @@ func buildTable(infos []*nodeInfo, o tableOpts, now time.Time) ([]string, [][]ce
 				plain(orDash(ni.cloud.instanceType)),
 				plain(orDash(ni.cloud.capacityType)),
 				plain(orDash(ni.cloud.zone)),
-				plain(orDash(ni.cloud.pool)),
 				plain(orDash(nodeAddress(ni.node, corev1.NodeInternalIP))),
+				plain(duration.HumanDuration(now.Sub(ni.node.CreationTimestamp.Time))),
+				levelCell(ni.node.Status.NodeInfo.KubeletVersion, ni.versionLevel),
+				statusCell(ni),
+				dim(ni.roles),
 			)
 		}
-		row = append(row,
-			plain(duration.HumanDuration(now.Sub(ni.node.CreationTimestamp.Time))),
-			levelCell(ni.node.Status.NodeInfo.KubeletVersion, ni.versionLevel),
-		)
+		row = append(row, nodeGroupCell(ni.cloud.pool))
 		rows = append(rows, row)
 	}
 	return headers, rows
@@ -1112,47 +1274,44 @@ func usageCell(name corev1.ResourceName, a amount, wide bool) cell {
 		return dim("-")
 	}
 	if wide {
-		s, p, _ := valueWithPct(name, a.used, a.alloc)
-		return levelCell(s, pctLevel(p))
+		s, p, known := valueWithPct(name, a.used, a.alloc)
+		return percentageCell(s, p, known)
 	}
 	p, ok := pct(a.used, a.alloc)
 	if !ok {
 		return plain(fmtAmount(name, a.used))
 	}
-	return levelCell(fmt.Sprintf("%d%%", p), pctLevel(p))
+	return percentageCell(fmt.Sprintf("%d%%", p), p, true)
 }
 
 // gpuCells renders accelerators. GPUs are expected to be fully used on
 // dedicated nodes, so they are colored by device health, not by percentage.
-func gpuCells(ni *nodeInfo, wide bool) []cell {
+func gpuCells(ni *nodeInfo) []cell {
 	if len(ni.accels) == 0 {
-		if wide {
-			return []cell{dim("-"), dim("-"), dim("-"), dim("-"), dim("-")}
-		}
-		return []cell{dim("-")}
+		return []cell{dim("-"), dim("-"), dim("-"), dim("-"), dim("-")}
 	}
 	st := styleAccent
 	if ni.gpuLevel != lvlOK {
 		st = ni.gpuLevel.style()
 	}
-	var types, reqs, allocs, avails, combined []string
+	model := dim(orDash(ni.gpuModel))
+	if ni.gpuModel != "" {
+		model.style = st
+	}
+	var types, reqs, allocs, avails []string
 	for _, a := range ni.accels {
 		label := acceleratorLabel(a.name)
 		types = append(types, label)
 		reqs = append(reqs, strconv.FormatInt(a.req, 10))
 		allocs = append(allocs, strconv.FormatInt(a.alloc, 10))
 		avails = append(avails, strconv.FormatInt(a.avail(), 10))
-		combined = append(combined, fmt.Sprintf("%d/%d %s", a.req, a.alloc, label))
-	}
-	if !wide {
-		return []cell{{strings.Join(combined, ", "), st}}
 	}
 	return []cell{
-		{strings.Join(types, ","), st},
+		{text: strings.Join(types, ","), style: st},
 		plain(strings.Join(reqs, ",")),
 		plain(strings.Join(allocs, ",")),
 		plain(strings.Join(avails, ",")),
-		dim(orDash(ni.gpuModel)),
+		model,
 	}
 }
 
@@ -1193,7 +1352,17 @@ func printTable(w io.Writer, indent string, headers []string, rows [][]cell) {
 	for _, r := range rows {
 		var lb strings.Builder
 		for i, c := range r {
-			lb.WriteString(c.style.Sprint(pad(c.text, i)))
+			if len(c.parts) == 0 {
+				lb.WriteString(c.style.Sprint(pad(c.text, i)))
+				continue
+			}
+			for j, part := range c.parts {
+				if j > 0 {
+					lb.WriteString(c.separator)
+				}
+				lb.WriteString(part.style.Sprint(part.text))
+			}
+			lb.WriteString(strings.TrimPrefix(pad(c.text, i), c.text))
 		}
 		_, _ = fmt.Fprintln(w, indent+lb.String())
 	}
@@ -1248,7 +1417,7 @@ func summary(infos []*nodeInfo, o tableOpts) string {
 		a     amount
 	}{{"CPU", corev1.ResourceCPU, cpu}, {"MEM", corev1.ResourceMemory, mem}} {
 		p, _ := pct(r.a.req, r.a.alloc)
-		s := fmt.Sprintf("%s %s/%s requested (%d%%)", r.label, fmtAmount(r.name, r.a.req), fmtAmount(r.name, r.a.alloc), p)
+		s := fmt.Sprintf("%s %d%%: %s/%s requested", r.label, p, fmtAmount(r.name, r.a.req), fmtAmount(r.name, r.a.alloc))
 		if o.hasMetrics {
 			up, _ := pct(r.a.used, r.a.alloc)
 			s += fmt.Sprintf(", %d%% used", up)
@@ -1299,6 +1468,11 @@ func sortInfos(infos []*nodeInfo, by string) {
 		return 0
 	}
 	slices.SortStableFunc(infos, func(a, b *nodeInfo) int {
+		if by == "nodegroup" {
+			if c := cmp.Compare(a.cloud.pool, b.cloud.pool); c != 0 {
+				return c
+			}
+		}
 		if c := cmp.Compare(key(b), key(a)); c != 0 {
 			return c
 		}
@@ -1413,7 +1587,7 @@ func renderDetail(w io.Writer, ni *nodeInfo, snap *snapshot, now time.Time) {
 		cloud = append(cloud, "zone "+c.zone)
 	}
 	if c.pool != "" {
-		cloud = append(cloud, "pool "+c.pool)
+		cloud = append(cloud, "node group "+c.pool)
 	}
 	if n.Spec.ProviderID != "" {
 		cloud = append(cloud, styleMeta.Sprint(n.Spec.ProviderID))
@@ -1491,7 +1665,7 @@ func detailResourceRows(ni *nodeInfo, hasMetrics bool) ([]string, [][]cell) {
 	rows := make([][]cell, 0, len(names))
 	for _, name := range names {
 		a := ni.get(name)
-		req, p, _ := valueWithPct(name, a.req, a.alloc)
+		req, p, known := valueWithPct(name, a.req, a.alloc)
 		reqLvl := pctLevel(p)
 		switch {
 		case name == corev1.ResourcePods:
@@ -1499,27 +1673,36 @@ func detailResourceRows(ni *nodeInfo, hasMetrics bool) ([]string, [][]cell) {
 		case isAccelerator(name):
 			reqLvl = lvlOK
 		}
-		lim, _, _ := valueWithPct(name, a.lim, a.alloc)
+		lim, lp, limKnown := valueWithPct(name, a.lim, a.alloc)
 		if name == corev1.ResourcePods {
 			lim = "-"
 		}
 		allocCell := plain(fmtAmount(name, a.alloc))
 		if isAccelerator(name) && a.alloc < a.capacity {
-			allocCell = cell{allocCell.text, styleWarn}
+			allocCell = cell{text: allocCell.text, style: styleWarn}
+		}
+		reqCell, limCell := levelCell(req, reqLvl), dim(lim)
+		if name == corev1.ResourceCPU || name == corev1.ResourceMemory {
+			reqCell = percentageCell(req, p, known)
+			limCell = percentageCell(lim, lp, limKnown)
 		}
 		row := []cell{
 			styleCellFor(name),
 			plain(fmtAmount(name, a.capacity)),
 			allocCell,
-			levelCell(req, reqLvl),
-			dim(lim),
+			reqCell,
+			limCell,
 			plain(fmtAmount(name, a.avail())),
 		}
 		if hasMetrics {
 			switch {
 			case a.hasUsed:
-				s, up, _ := valueWithPct(name, a.used, a.alloc)
-				row = append(row, levelCell(s, pctLevel(up)))
+				s, up, known := valueWithPct(name, a.used, a.alloc)
+				usedCell := levelCell(s, pctLevel(up))
+				if name == corev1.ResourceCPU || name == corev1.ResourceMemory {
+					usedCell = percentageCell(s, up, known)
+				}
+				row = append(row, usedCell)
 			default:
 				row = append(row, dim("-"))
 			}
@@ -1531,9 +1714,9 @@ func detailResourceRows(ni *nodeInfo, hasMetrics bool) ([]string, [][]cell) {
 
 func styleCellFor(name corev1.ResourceName) cell {
 	if isAccelerator(name) {
-		return cell{string(name), styleAccent}
+		return cell{text: string(name), style: styleAccent}
 	}
-	return cell{string(name), styleKey}
+	return cell{text: string(name), style: styleKey}
 }
 
 // ---------------------------------------------------------------------------

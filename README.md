@@ -241,29 +241,50 @@ Like `kubectl get nodes`, but with CPU, memory and GPU totals, requests and real
 
 ```
 kgn
-NAME          STATUS                      ROLES   CPU REQ        CPU USE  MEM REQ            MEM USE  GPU         PODS    AGE  VERSION
-ip-10-0-1-23  Ready                       <none>  3.2/7.9 (41%)  27%      11.2Gi/30Gi (37%)  22%      -           28/110  41d  v1.34.2
-ip-10-0-1-88  Ready                       <none>  6/7.9 (76%)    61%      20Gi/60Gi (33%)    30%      2/4 nvidia  14/110  12d  v1.34.2
-ip-10-0-2-17  Unknown,SchedulingDisabled  <none>  15.1/16 (95%)  -        54Gi/62Gi (87%)    -        -           54/58   2d   v1.32.3
-Total: 3 nodes (1 not ready, 1 cordoned, 1 with issues) · CPU 24.3/31.8 requested (76%), 35% used · MEM 85.2Gi/152Gi requested (56%), 21% used · nvidia 2/4
+NAME          CPU REQ       CPU USE  MEM REQ         MEM USE  GPU TYPE  GPU REQ  GPU ALLOC  GPU AVAIL  GPU MODEL    PODS    NODE GROUP
+ip-10-0-1-23  41%: 3.2/7.9  27%      37%: 11.2G/30G  22%      -         -        -          -          -            28/110  general
+ip-10-0-2-17  95%: 15.1/16  -        87%: 54G/62G    -        -         -        -          -          -            54/58   general
+ip-10-0-1-88  76%: 6/7.9    61%      33%: 20G/60G    30%      nvidia    2        4          2          NVIDIA-A10G  14/110  gpu
+Total: 3 nodes (1 not ready, 1 cordoned, 1 with issues) · CPU 76%: 24.3/31.8 requested, 35% used · MEM 56%: 85.2G/152G requested, 21% used · nvidia 2/4
 ```
 
 ### Features
 
+- **Resource format** puts percentages first, e.g. `11%: 13.5G/120.3G`; memory uses binary sizes with compact `K`, `M`, `G`, and `T` suffixes
 - **Requested** is computed like `kubectl describe node`: the node's non-terminated pods, counting init containers, sidecars, pod-level resources and pod overhead
 - **Usage** comes from metrics-server (`kubectl top node`) when it is installed; the USE columns are hidden when it isn't
-- **GPUs and accelerators** are detected from extended resources: NVIDIA (including MIG slices), AMD, Intel, AWS Neuron, Google TPU and Habana Gaudi. The GPU column only appears when a node has one
+- **GPUs and accelerators** are detected from extended resources: NVIDIA (including MIG slices), AMD, Intel, AWS Neuron, Google TPU and Habana Gaudi. When any displayed node has an accelerator, both default and wide output show GPU TYPE, REQ, ALLOC, AVAIL, and MODEL columns
+- **GPU model** prefers recognized labels such as `nvidia.com/gpu.product`, then infers known EC2 GPU families from the instance-type label on AWS nodes using [AWS specifications](https://docs.aws.amazon.com/ec2/latest/instancetypes/ac.html). Unknown models display `-`. This adds no cloud API calls and preserves device-plugin counts; `g6f.xlarge`, for example, exposes an NVIDIA L4 partition as one schedulable device.
 - **Health colors**:
-  - STATUS: red for NotReady/Unknown, `NetworkUnavailable`, or `unreachable` / `not-ready` / `out-of-service` taints; yellow for cordoned nodes, Memory/Disk/PID pressure, node-problem-detector conditions, and cluster-autoscaler or Karpenter removal
-  - CPU/MEM: yellow above 80% requested or used, red above 95%
+  - STATUS (`-o wide`) follows VERSION: green `Healthy` only when all node health checks pass; otherwise only failing checks appear, each yellow or red (including GPU health and kubelet skew). Readiness conditions such as `KernelReady`, `StorageReady`, `ContainerRuntimeReady`, and `NetworkingReady` pass when True; pressure/problem conditions pass when False. Node conditions and taints are red for NotReady/Unknown, `NetworkUnavailable`, or `unreachable` / `not-ready` / `out-of-service` taints; yellow for cordoned nodes, Memory/Disk/PID pressure, node-problem-detector conditions, and cluster-autoscaler or Karpenter removal
+  - CPU/MEM percentages: blue below 40%, cyan at 40–60%, green above 60–80%, yellow above 80–95%, red above 95%. The scale follows displayed whole-number percentages and applies to requests, limits, and usage; quantities stay neutral
   - PODS: yellow at 90% of the node's pod limit, red when full
-  - VERSION: yellow when the kubelet lags the control plane, red outside the supported skew (more than 3 minor versions behind, or newer)
+  - VERSION (`-o wide`): yellow when the kubelet lags the control plane, red outside the supported skew (more than 3 minor versions behind, or newer)
   - GPU: yellow when the device plugin reports unhealthy devices (allocatable below capacity), or when a node is labelled with NVIDIA GPUs but advertises none
 - `-d` / `--detail` adds a section per node: every health issue with its reason and message, conditions and last heartbeat, taints, a capacity / allocatable / requests / limits / available / usage table for every resource, GPU model, kubelet and runtime versions, OS and kernel, cloud metadata, addresses, and recent Warning events
 - `-u` shows only nodes with a health problem; combine with `-d` to see why: `kgn -u -d`
-- `-o wide` splits each resource into REQ / LIM / ALLOC / AVAIL / USE columns and adds GPU model, instance type, capacity type (spot / on-demand), zone, node pool and internal IP (EKS, Karpenter, GKE and AKS labels)
-- Filter by node name (`kgn node-1 node-2`) or label selector (`-l`), and sort with `--sort cpu|mem|gpu|pods|age|name`
+- `-o wide` splits each resource into REQ / LIM / ALLOC / AVAIL / USE columns and adds instance type, capacity type (spot / on-demand), zone and internal IP, followed by AGE, VERSION, STATUS, ROLES, and NODE GROUP; AGE, VERSION, STATUS, and ROLES are hidden in the default view; NODE GROUP is always the final column
+- Filter by node name (`kgn node-1 node-2`) or label selector (`-l`), and sort with `--sort nodegroup|name|cpu|mem|gpu|pods|age`; the default is alphabetical by node group, then node name (unlabeled nodes first)
 - Colors are disabled when piped, with `--no-color`, or when `NO_COLOR` is set
+
+### Node-group labels
+
+Both `kgn` and `kgn -o wide` end with `NODE GROUP`, using the first nonempty matching label.
+Provider names take priority over provider IDs and custom fallbacks. Missing labels display `-`. Node names and their groups share a consistent color, stable across runs and filters. Modern terminals use an 18-color blue/cyan/violet/pink palette, with a basic-color fallback. Warning yellow and critical red remain reserved for health and resource problems; the finite group palette can repeat colors.
+
+| Provider | Labels (in preference order) |
+| --- | --- |
+| Karpenter | `karpenter.sh/nodepool` |
+| EKS / eksctl | `eks.amazonaws.com/nodegroup`, `alpha.eksctl.io/nodegroup-name` |
+| GKE | `cloud.google.com/gke-nodepool` |
+| AKS | `kubernetes.azure.com/agentpool`, `agentpool` |
+| [DigitalOcean](https://docs.digitalocean.com/products/kubernetes/details/managed/) | `doks.digitalocean.com/node-pool`, `doks.digitalocean.com/node-pool-id` |
+| [IBM Cloud](https://cloud.ibm.com/docs/containers?topic=containers-vpc-subnets) | `ibm-cloud.kubernetes.io/worker-pool-name` |
+| [Scaleway](https://www.scaleway.com/en/blog/how-to-deploy-and-distribute-the-workload-on-a-multi-cloud-kubernetes-environment/) | `k8s.scaleway.com/pool-name`, `k8s.scaleway.com/pool` |
+| [OVHcloud](https://docs.ovhcloud.com/en/guides/public-cloud/containers-orchestration/managed-kubernetes/label-nodeaffinity-node-pools) | `nodepool` |
+| Custom fallbacks | `node.kubernetes.io/pool`, `kubernetes.io/nodegroup`, `nodegroup`, `nodepool` |
+
+The `kubernetes.io/nodegroup` and `nodegroup` fallbacks also match [kgng](https://github.com/jessegoodier/kgng/blob/main/src/kube_nodegroup_viewer/nodegroups.py). They are conventions, not standard Kubernetes labels.
 
 ### Usage
 
@@ -275,7 +296,7 @@ Flags:
   -d, --detail               Show why a node is unhealthy plus conditions, taints, resources, events.
   -u, --unhealthy            Only show nodes with a health problem.
   -o, --output <format>      Output format: wide (split resource columns, cloud info).
-  --sort <key>               Sort by name, cpu, mem, gpu, pods, age (cpu/mem/gpu/pods: highest first).  (default: name)
+  --sort <key>               Sort by nodegroup, name, cpu, mem, gpu, pods, age (nodegroup: group then name; cpu/mem/gpu/pods: highest first).  (default: nodegroup)
   --no-color                 Disable colored output (NO_COLOR is also honored).
   --kubeconfig <path>        Path to kubeconfig file.  (default: $KUBECONFIG or ~/.kube/config)
   --completions <shell>      Print shell completion script (bash or zsh).
