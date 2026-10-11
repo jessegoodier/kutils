@@ -7,7 +7,7 @@ export PATH := `go env GOPATH` + "/bin:" + env("PATH")
 
 version := `cat VERSION | tr -d '[:space:]'`
 ldflags := "-s -w -X main.version=" + version
-tools := "kgc kgpv ksd"
+tools := "kgc kgpv ksd kgn"
 
 default:
     @just --list

@@ -138,7 +138,7 @@ jobs:
         with:
           go-version-file: go.mod
 
-      - name: Build kgc, kgpv and ksd
+      - name: Build kgc, kgpv, ksd and kgn
         env:
           GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
@@ -148,14 +148,17 @@ jobs:
           KGC_BIN=kgc
           KGPV_BIN=kgpv
           KSD_BIN=ksd
+          KGN_BIN=kgn
           if [ "${{ matrix.goos }}" = "windows" ]; then
             KGC_BIN=kgc.exe
             KGPV_BIN=kgpv.exe
             KSD_BIN=ksd.exe
+            KGN_BIN=kgn.exe
           fi
           go build -ldflags "-s -w -X main.version=${VERSION}" -o "${KGC_BIN}" ./cmd/kgc
           go build -ldflags "-s -w -X main.version=${VERSION}" -o "${KGPV_BIN}" ./cmd/kgpv
           go build -ldflags "-s -w -X main.version=${VERSION}" -o "${KSD_BIN}" ./cmd/ksd
+          go build -ldflags "-s -w -X main.version=${VERSION}" -o "${KGN_BIN}" ./cmd/kgn
 
       - name: Package artifacts
         run: |
@@ -167,16 +170,20 @@ jobs:
             zip "kgc_${VERSION}_${OS}_${ARCH}.zip" kgc.exe
             zip "kgpv_${VERSION}_${OS}_${ARCH}.zip" kgpv.exe
             zip "ksd_${VERSION}_${OS}_${ARCH}.zip" ksd.exe
+            zip "kgn_${VERSION}_${OS}_${ARCH}.zip" kgn.exe
             echo "KGC_ARTIFACT=kgc_${VERSION}_${OS}_${ARCH}.zip" >> "$GITHUB_ENV"
             echo "KGPV_ARTIFACT=kgpv_${VERSION}_${OS}_${ARCH}.zip" >> "$GITHUB_ENV"
             echo "KSD_ARTIFACT=ksd_${VERSION}_${OS}_${ARCH}.zip" >> "$GITHUB_ENV"
+            echo "KGN_ARTIFACT=kgn_${VERSION}_${OS}_${ARCH}.zip" >> "$GITHUB_ENV"
           else
             tar czf "kgc_${VERSION}_${OS}_${ARCH}.tar.gz" kgc
             tar czf "kgpv_${VERSION}_${OS}_${ARCH}.tar.gz" kgpv
             tar czf "ksd_${VERSION}_${OS}_${ARCH}.tar.gz" ksd
+            tar czf "kgn_${VERSION}_${OS}_${ARCH}.tar.gz" kgn
             echo "KGC_ARTIFACT=kgc_${VERSION}_${OS}_${ARCH}.tar.gz" >> "$GITHUB_ENV"
             echo "KGPV_ARTIFACT=kgpv_${VERSION}_${OS}_${ARCH}.tar.gz" >> "$GITHUB_ENV"
             echo "KSD_ARTIFACT=ksd_${VERSION}_${OS}_${ARCH}.tar.gz" >> "$GITHUB_ENV"
+            echo "KGN_ARTIFACT=kgn_${VERSION}_${OS}_${ARCH}.tar.gz" >> "$GITHUB_ENV"
           fi
 
       - name: Upload kgc artifact
@@ -198,6 +205,13 @@ jobs:
         with:
           name: ${{ env.KSD_ARTIFACT }}
           path: ${{ env.KSD_ARTIFACT }}
+          if-no-files-found: error
+
+      - name: Upload kgn artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ env.KGN_ARTIFACT }}
+          path: ${{ env.KGN_ARTIFACT }}
           if-no-files-found: error
 
   release:
@@ -263,7 +277,7 @@ jobs:
           VERSION=${{ needs.version.outputs.new_version }}
           CHECKSUMS=/tmp/checksums/checksums.txt
 
-          for TOOL in kgc kgpv ksd; do
+          for TOOL in kgc kgpv ksd kgn; do
             DARWIN_AMD64=$(grep "${TOOL}_${VERSION}_darwin_amd64.tar.gz" "$CHECKSUMS" | awk '{print $1}')
             DARWIN_ARM64=$(grep "${TOOL}_${VERSION}_darwin_arm64.tar.gz" "$CHECKSUMS" | awk '{print $1}')
             LINUX_AMD64=$(grep  "${TOOL}_${VERSION}_linux_amd64.tar.gz"  "$CHECKSUMS" | awk '{print $1}')
