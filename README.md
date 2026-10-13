@@ -241,12 +241,12 @@ Like `kubectl get nodes`, but with CPU, memory and GPU totals, requests and real
 
 ```
 kgn
-NAME          CPU REQ        CPU USE  MEM REQ          MEM USE  GPU TYPE  GPU REQ  GPU ALLOC  GPU AVAIL  GPU MODEL    PODS    NODE GROUP
-ip-10-0-1-23  41%: 3.2/7.9   27%      37%: 11.2G/30G   22%      -         -        -          -          -            28/110  general
-ip-10-0-2-17  95%: 15.1/16   -        87%: 54G/62G     -        -         -        -          -          -            54/58   general
-ip-10-0-1-88  76%: 6/7.9     61%      33%: 20G/60G     30%      nvidia    2        4          2          NVIDIA-A10G  14/110  gpu
-────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
-Summary       76%: 24.3/31.8 35%      56%: 85.2G/152G  21%      nvidia    2        4          2          NVIDIA-A10G  96/278  -
+NAME          CPU REQ        CPU USE │ MEM REQ          MEM USE  GPU TYPE  GPU REQ  GPU ALLOC  GPU AVAIL  GPU MODEL │ PODS    NODE GROUP
+ip-10-0-1-23  41%: 3.2/7.9   27%     │ 37%: 11.2G/30G   22%      -         -        -          -          -       │ 28/110  general
+ip-10-0-2-17  95%: 15.1/16   -       │ 87%: 54G/62G     -        -         -        -          -          -       │ 54/58   general
+ip-10-0-1-88  76%: 6/7.9     61%     │ 33%: 20G/60G     30%      nvidia    2        4          2          NVIDIA-A10G │ 14/110  gpu
+─────────────────────────────────────┼───────────────────────────────────────────────┼──────────────────────────────────
+Summary       76%: 24.3/31.8 35%     │ 56%: 85.2G/152G  21%      nvidia    2        4          2          NVIDIA-A10G │ 96/278  -
 ```
 
 ### Features
@@ -264,7 +264,8 @@ Summary       76%: 24.3/31.8 35%      56%: 85.2G/152G  21%      nvidia    2     
   - GPU: yellow when the device plugin reports unhealthy devices (allocatable below capacity), or when a node is labelled with NVIDIA GPUs but advertises none
 - `-d` / `--detail` adds a section per node: every health issue with its reason and message, conditions and last heartbeat, taints, a capacity / allocatable / requests / limits / available / usage table for every resource, GPU model, kubelet and runtime versions, OS and kernel, cloud metadata, addresses, and recent Warning events
 - `-u` shows only nodes with a health problem; combine with `-d` to see why: `kgn -u -d`
-- `-o wide` splits each resource into REQ / LIM / ALLOC / AVAIL / USE columns and adds instance type, capacity type (spot / on-demand), zone and internal IP, followed by AGE, VERSION, STATUS, ROLES, and NODE GROUP; AGE, VERSION, STATUS, and ROLES are hidden in the default view; NODE GROUP is always the final column
+- Ephemeral storage: STATUS adds yellow `ephemeral-storage-low` when the node filesystem is strictly more than 75% full, calculated as `(capacity - available) / capacity` from kubelet `/stats/summary`. Exactly 75% does not warn. Wide output adds `EPHEMERAL USED/AVAIL` (binary sizes, e.g. `64.8G/15.1G`); AVAIL is actual filesystem free space, independent of pod requests and node allocatable. USED can differ from capacity minus available because of filesystem reservations. This is an early warning; existing `DiskPressure` checks also cover inode exhaustion and separate image/container filesystems. Stats require `get` on `nodes/proxy`; unavailable or invalid stats show `-`, with the reason in `-d`, and do not trigger a storage warning. Summary totals show `-` if any displayed node lacks stats. Reads use up to eight concurrent requests with a five-second timeout each, within the command's overall timeout.
+- `-o wide` shows CPU/MEM REQ/LIM, ALLOC/AVAIL, and USE columns, GPU ALLOC/AVAIL, and EPHEMERAL USED/AVAIL; paired values are slash-separated with units and percentage colors preserved and adds instance type, capacity type (spot / on-demand), zone and internal IP, followed by AGE, VERSION, STATUS, ROLES, and NODE GROUP; AGE, VERSION, STATUS, and ROLES are hidden in the default view; NODE GROUP is always the final column
 - Filter by node name (`kgn node-1 node-2`) or label selector (`-l`), and sort with `--sort nodegroup|name|cpu|mem|gpu|pods|age`; the default is alphabetical by node group, then node name (unlabeled nodes first)
 - Colors are disabled when piped, with `--no-color`, or when `NO_COLOR` is set
 

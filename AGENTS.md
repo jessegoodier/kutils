@@ -26,6 +26,12 @@ Tasks are run with [`just`](https://github.com/casey/just) (see `justfile`; `jus
 - `just update-deps` — update dependencies and tidy
 - `just release-build` — cross-compile all platforms into `./dist`
 
+## Build and handoff
+
+- After each code change, run `just build` from the `kutils` directory so the binaries in `./bin` reflect the latest changes.
+- In the final response, report the build result and provide the runnable path for each affected tool (for example, `~/git-jesse/kutils-root/kutils/bin/kgn`) with example arguments that exercise the behavior just changed.
+- If the build fails, explain the failure and do not present an older binary as containing the changes.
+
 ## Versioning and release
 
 - The version is a `var version = "dev"` in each `main.go`, overridden with `-X main.version=...`; when still `dev`, `init()` falls back to the module version from `debug.ReadBuildInfo` (so `go install ...@vX` reports correctly).

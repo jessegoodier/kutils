@@ -15,6 +15,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 	"unicode/utf8"
 
@@ -60,10 +61,11 @@ var (
 	styleAccent = color.Style{color.FgMagenta}
 )
 
-// Thresholds (percent) for coloring requested/used CPU and memory.
+// Thresholds (percent) for storage health and resource coloring.
 const (
-	warnPct = 80
-	critPct = 95
+	ephemeralWarnPct = 75
+	warnPct          = 80
+	critPct          = 95
 	// Pod-count thresholds: a full node can't take more pods regardless of CPU/memory.
 	podsWarnPct = 90
 	podsCritPct = 100
@@ -127,7 +129,36 @@ type cloudInfo struct {
 	instanceType, capacityType, zone, pool string
 }
 
+// filesystemUsage describes nodefs, independently of scheduler reservations.
+type filesystemUsage struct {
+	Capacity  int64  `json:"capacityBytes"`
+	Used      *int64 `json:"usedBytes"`
+	Available *int64 `json:"availableBytes"`
+}
+
+func (f *filesystemUsage) valid() bool {
+	return f != nil && f.Capacity > 0 && f.Used != nil && f.Available != nil &&
+		*f.Used >= 0 && *f.Used <= f.Capacity && *f.Available >= 0 && *f.Available <= f.Capacity
+}
+
+func (f *filesystemUsage) low() bool {
+	// Compare without rounding percentages or overflowing large byte counts.
+	return f.valid() && f.Capacity-*f.Available > f.Capacity/100*ephemeralWarnPct+f.Capacity%100*ephemeralWarnPct/100
+}
+
+func storageCells(f *filesystemUsage) []cell {
+	if !f.valid() {
+		return []cell{dim("-"), dim("-")}
+	}
+	lvl := lvlOK
+	if f.low() {
+		lvl = lvlWarn
+	}
+	return []cell{levelCell(fmtBytes(*f.Used), lvl), levelCell(fmtBytes(*f.Available), lvl)}
+}
+
 type nodeInfo struct {
+	storage      *filesystemUsage
 	node         *corev1.Node
 	status       string // e.g. "Ready,SchedulingDisabled"
 	statusLevel  level  // from conditions, cordon and taints
@@ -196,6 +227,7 @@ func printUsage() {
 	fmt.Println("  CPU/MEM REQ   requested / allocatable (percent requested)")
 	fmt.Println("  CPU/MEM USE   actual usage from metrics-server (hidden when unavailable)")
 	fmt.Println("  GPU           requested / allocatable per accelerator type")
+	fmt.Println("  EPHEMERAL USED/AVAIL (-o wide)   node filesystem bytes from kubelet; warns above 75% full")
 	fmt.Println()
 
 	fmt.Println(styleSect.Sprint("EXAMPLES"))
@@ -349,6 +381,8 @@ func newClient(kubeconfig string) (kubernetes.Interface, error) {
 // ---------------------------------------------------------------------------
 
 type snapshot struct {
+	storage       map[string]*filesystemUsage
+	storageErrors map[string]error
 	nodes         []corev1.Node
 	pods          []corev1.Pod
 	usage         map[string]corev1.ResourceList // nil when metrics-server is unavailable
@@ -388,6 +422,7 @@ func fetch(ctx context.Context, cs kubernetes.Interface, selector string, names 
 	}
 
 	snap.usage = fetchNodeMetrics(ctx, cs)
+	snap.storage, snap.storageErrors = fetchNodeStorage(ctx, cs, snap.nodes)
 
 	if withEvents {
 		snap.events, snap.eventsErr = fetchNodeEvents(ctx, cs)
@@ -448,6 +483,60 @@ func parseNodeMetrics(raw []byte) map[string]corev1.ResourceList {
 	return out
 }
 
+// fetchNodeStorage uses bounded parallel requests to the kubelet Summary API.
+// Missing permissions (nodes/proxy), unsupported stats and timeouts are optional failures.
+func fetchNodeStorage(ctx context.Context, cs kubernetes.Interface, nodes []corev1.Node) (map[string]*filesystemUsage, map[string]error) {
+	out := map[string]*filesystemUsage{}
+	errs := map[string]error{}
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+	slots := make(chan struct{}, 8)
+	for _, n := range nodes {
+		wg.Go(func() {
+			select {
+			case slots <- struct{}{}:
+				defer func() { <-slots }()
+			case <-ctx.Done():
+				mu.Lock()
+				errs[n.Name] = ctx.Err()
+				mu.Unlock()
+				return
+			}
+			requestCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+			defer cancel()
+			raw, err := cs.CoreV1().RESTClient().Get().Resource("nodes").Name(n.Name).SubResource("proxy").Suffix("stats", "summary").DoRaw(requestCtx)
+			var fs *filesystemUsage
+			if err == nil {
+				fs, err = parseNodeStorage(raw)
+			}
+			mu.Lock()
+			defer mu.Unlock()
+			if err != nil {
+				errs[n.Name] = err
+			} else {
+				out[n.Name] = fs
+			}
+		})
+	}
+	wg.Wait()
+	return out, errs
+}
+
+func parseNodeStorage(raw []byte) (*filesystemUsage, error) {
+	var summary struct {
+		Node struct {
+			FS *filesystemUsage `json:"fs"`
+		} `json:"node"`
+	}
+	if err := json.Unmarshal(raw, &summary); err != nil {
+		return nil, err
+	}
+	if !summary.Node.FS.valid() {
+		return nil, errors.New("node filesystem statistics missing or invalid")
+	}
+	return summary.Node.FS, nil
+}
+
 func fetchNodeEvents(ctx context.Context, cs kubernetes.Interface) (map[string][]corev1.Event, error) {
 	list, err := cs.CoreV1().Events("").List(ctx, metav1.ListOptions{
 		FieldSelector: "involvedObject.kind=Node,type=Warning",
@@ -504,7 +593,12 @@ func buildInfos(snap *snapshot) []*nodeInfo {
 		if snap.usage != nil {
 			usage = snap.usage[n.Name]
 		}
-		infos = append(infos, buildNodeInfo(n, podsByNode[n.Name], usage, ref))
+		ni := buildNodeInfo(n, podsByNode[n.Name], usage, ref)
+		ni.storage = snap.storage[n.Name]
+		if ni.storage.low() {
+			ni.issues = append(ni.issues, issue{lvlWarn, fmt.Sprintf("ephemeral-storage-low: node filesystem %.2f%% full (above %d%%); used %s, available %s", 100*float64(ni.storage.Capacity-*ni.storage.Available)/float64(ni.storage.Capacity), ephemeralWarnPct, fmtBytes(*ni.storage.Used), fmtBytes(*ni.storage.Available)), "ephemeral-storage-low"})
+		}
+		infos = append(infos, ni)
 	}
 	return infos
 }
@@ -1199,7 +1293,8 @@ type tableOpts struct {
 	wide, hasMetrics, showGPU bool
 }
 
-func buildTable(infos []*nodeInfo, o tableOpts, now time.Time) ([]string, [][]cell) {
+// tableHeaders describes the source columns before wide pairs are compacted.
+func tableHeaders(o tableOpts) []string {
 	headers := []string{"NAME"}
 	for _, label := range []string{"CPU", "MEM"} {
 		if o.wide {
@@ -1214,12 +1309,71 @@ func buildTable(infos []*nodeInfo, o tableOpts, now time.Time) ([]string, [][]ce
 	if o.showGPU {
 		headers = append(headers, "GPU TYPE", "GPU REQ", "GPU ALLOC", "GPU AVAIL", "GPU MODEL")
 	}
+	if o.wide {
+		headers = append(headers, "EPHEMERAL USED", "EPHEMERAL AVAIL")
+	}
 	headers = append(headers, "PODS")
 	if o.wide {
 		headers = append(headers, "INSTANCE", "CAPACITY", "ZONE", "INTERNAL-IP", "AGE", "VERSION", "STATUS", "ROLES")
 	}
 	headers = append(headers, "NODE GROUP")
 
+	return headers
+}
+
+// pairCell flattens styled segments so each percentage keeps its own color.
+func pairCell(left, right cell) cell {
+	parts := []cell{}
+	for i, c := range []cell{left, right} {
+		if i > 0 {
+			parts = append(parts, plain("/"))
+		}
+		if len(c.parts) == 0 {
+			parts = append(parts, c)
+			continue
+		}
+		for j, part := range c.parts {
+			if j > 0 && c.separator != "" {
+				parts = append(parts, plain(c.separator))
+			}
+			parts = append(parts, part)
+		}
+	}
+	return cell{text: left.text + "/" + right.text, style: stylePlain, parts: parts}
+}
+
+func compactWideTable(headers []string, rows [][]cell) ([]string, [][]cell) {
+	pairs := map[string]string{
+		"CPU REQ": "CPU LIM", "CPU ALLOC": "CPU AVAIL",
+		"MEM REQ": "MEM LIM", "MEM ALLOC": "MEM AVAIL",
+		"GPU ALLOC": "GPU AVAIL", "EPHEMERAL USED": "EPHEMERAL AVAIL",
+	}
+	var compactHeaders []string
+	compactRows := make([][]cell, len(rows))
+	for i := 0; i < len(headers); i++ {
+		second, paired := pairs[headers[i]]
+		paired = paired && i+1 < len(headers) && headers[i+1] == second
+		header := headers[i]
+		if paired {
+			header += "/" + strings.TrimPrefix(second, strings.Split(header, " ")[0]+" ")
+		}
+		compactHeaders = append(compactHeaders, header)
+		for j, row := range rows {
+			c := row[i]
+			if paired {
+				c = pairCell(c, row[i+1])
+			}
+			compactRows[j] = append(compactRows[j], c)
+		}
+		if paired {
+			i++
+		}
+	}
+	return compactHeaders, compactRows
+}
+
+func buildTable(infos []*nodeInfo, o tableOpts, now time.Time) ([]string, [][]cell) {
+	headers := tableHeaders(o)
 	rows := make([][]cell, 0, len(infos))
 	for _, ni := range infos {
 		nameCell := plain(ni.node.Name)
@@ -1249,6 +1403,9 @@ func buildTable(infos []*nodeInfo, o tableOpts, now time.Time) ([]string, [][]ce
 		if o.showGPU {
 			row = append(row, gpuCells(ni)...)
 		}
+		if o.wide {
+			row = append(row, storageCells(ni.storage)...)
+		}
 		pods := ni.get(corev1.ResourcePods)
 		pp, _ := pct(pods.req, pods.alloc)
 		row = append(row, levelCell(fmt.Sprintf("%d/%d", pods.req, pods.alloc), podsLevel(pp)))
@@ -1266,6 +1423,9 @@ func buildTable(infos []*nodeInfo, o tableOpts, now time.Time) ([]string, [][]ce
 		}
 		row = append(row, nodeGroupCell(ni.cloud.pool))
 		rows = append(rows, row)
+	}
+	if o.wide {
+		return compactWideTable(headers, rows)
 	}
 	return headers, rows
 }
@@ -1325,10 +1485,34 @@ func nodeAddress(n *corev1.Node, t corev1.NodeAddressType) string {
 	return ""
 }
 
+// tableColumnDividers returns column indices after which the main node table
+// draws white vertical rules (CPU|memory, then memory|pods/metadata).
+func tableColumnDividers(headers []string) []int {
+	var out []int
+	for i, h := range headers {
+		if strings.HasPrefix(h, "MEM") && i > 0 {
+			out = append(out, i-1)
+			break
+		}
+	}
+	if i := slices.Index(headers, "PODS"); i > 0 {
+		out = append(out, i-1)
+	}
+	return out
+}
+
+func gapAfterColumn(i int, dividers []int, gap int) int {
+	if i >= 0 && slices.Contains(dividers, i) {
+		return 3 // " │ "
+	}
+	return gap
+}
+
 // printTable pads plain text first, then colors it, so ANSI codes never
 // affect alignment.
 func printTable(w io.Writer, indent string, headers []string, rows [][]cell, summary ...[]cell) {
 	const gap = 2
+	dividers := tableColumnDividers(headers)
 	widths := make([]int, len(headers))
 	for i, h := range headers {
 		widths[i] = utf8.RuneCountInString(h)
@@ -1349,62 +1533,116 @@ func printTable(w io.Writer, indent string, headers []string, rows [][]cell, sum
 			}
 		}
 	}
+	gapWidth := func(i int) int {
+		if i >= len(widths)-1 {
+			return 0
+		}
+		return gapAfterColumn(i, dividers, gap)
+	}
 	pad := func(s string, i int) string {
-		if i == len(widths)-1 {
+		if i >= len(widths)-1 {
 			return s
 		}
-		return s + strings.Repeat(" ", widths[i]-utf8.RuneCountInString(s)+gap)
+		n := widths[i] - utf8.RuneCountInString(s)
+		if n < 0 {
+			n = 0
+		}
+		return s + strings.Repeat(" ", n)
+	}
+	writeGap := func(b *strings.Builder, i int) {
+		if i >= len(widths)-1 {
+			return
+		}
+		if slices.Contains(dividers, i) {
+			b.WriteByte(' ')
+			b.WriteString(stylePlain.Sprint("│"))
+			b.WriteByte(' ')
+			return
+		}
+		b.WriteString(strings.Repeat(" ", gap))
+	}
+	writeCells := func(b *strings.Builder, cells []cell) {
+		for i, c := range cells {
+			if i >= len(widths) {
+				break
+			}
+			padded := pad(c.text, i)
+			if len(c.parts) == 0 {
+				b.WriteString(c.style.Sprint(padded))
+			} else {
+				for j, part := range c.parts {
+					if j > 0 {
+						b.WriteString(c.separator)
+					}
+					b.WriteString(part.style.Sprint(part.text))
+				}
+				b.WriteString(strings.TrimPrefix(padded, c.text))
+			}
+			writeGap(b, i)
+		}
 	}
 
 	var hb strings.Builder
+	headerCells := make([]cell, len(headers))
 	for i, h := range headers {
-		hb.WriteString(pad(h, i))
+		headerCells[i] = cell{text: h, style: styleTitle}
 	}
-	_, _ = fmt.Fprintln(w, indent+styleTitle.Sprint(hb.String()))
+	writeCells(&hb, headerCells)
+	_, _ = fmt.Fprintln(w, indent+hb.String())
 	for _, r := range rows {
 		var lb strings.Builder
-		for i, c := range r {
-			if len(c.parts) == 0 {
-				lb.WriteString(c.style.Sprint(pad(c.text, i)))
-				continue
-			}
-			for j, part := range c.parts {
-				if j > 0 {
-					lb.WriteString(c.separator)
-				}
-				lb.WriteString(part.style.Sprint(part.text))
-			}
-			lb.WriteString(strings.TrimPrefix(pad(c.text, i), c.text))
-		}
+		writeCells(&lb, r)
 		_, _ = fmt.Fprintln(w, indent+lb.String())
 	}
 	if len(sumRow) > 0 {
 		totalWidth := 0
 		for i, width := range widths {
-			totalWidth += width
-			if i < len(widths)-1 {
-				totalWidth += gap
-			}
+			totalWidth += width + gapWidth(i)
 		}
 		if totalWidth > 0 {
-			_, _ = fmt.Fprintln(w, indent+styleMeta.Sprint(strings.Repeat("─", totalWidth)))
+			_, _ = fmt.Fprintln(w, indent+summaryRule(widths, dividers, gap, totalWidth))
 		}
 		var lb strings.Builder
-		for i, c := range sumRow {
-			if len(c.parts) == 0 {
-				lb.WriteString(c.style.Sprint(pad(c.text, i)))
-				continue
-			}
-			for j, part := range c.parts {
-				if j > 0 {
-					lb.WriteString(c.separator)
-				}
-				lb.WriteString(part.style.Sprint(part.text))
-			}
-			lb.WriteString(strings.TrimPrefix(pad(c.text, i), c.text))
-		}
+		writeCells(&lb, sumRow)
 		_, _ = fmt.Fprintln(w, indent+lb.String())
 	}
+}
+
+// summaryRule is the horizontal line above Summary. Vertical rules cross it as
+// white ┼ so the column dividers stay aligned.
+func summaryRule(widths []int, dividers []int, gap, totalWidth int) string {
+	var crosses []int
+	for _, div := range dividers {
+		if div < 0 || div >= len(widths)-1 {
+			continue
+		}
+		off := 0
+		for i := 0; i <= div; i++ {
+			off += widths[i]
+			if i < div {
+				off += gapAfterColumn(i, dividers, gap)
+			}
+		}
+		off++ // space before │
+		crosses = append(crosses, off)
+	}
+	if len(crosses) == 0 {
+		return styleMeta.Sprint(strings.Repeat("─", totalWidth))
+	}
+	slices.Sort(crosses)
+	var b strings.Builder
+	last := 0
+	for _, p := range crosses {
+		if p > last {
+			b.WriteString(styleMeta.Sprint(strings.Repeat("─", p-last)))
+		}
+		b.WriteString(stylePlain.Sprint("┼"))
+		last = p + 1
+	}
+	if last < totalWidth {
+		b.WriteString(styleMeta.Sprint(strings.Repeat("─", totalWidth-last)))
+	}
+	return b.String()
 }
 
 // buildSummaryRow builds a cluster-wide summary row formatted identically to node rows.
@@ -1524,6 +1762,20 @@ func buildSummaryRow(infos []*nodeInfo, o tableOpts) []cell {
 		}
 	}
 
+	if o.wide {
+		// Avoid presenting a partial sum as a cluster total.
+		total := &filesystemUsage{Used: new(int64), Available: new(int64)}
+		for _, ni := range infos {
+			if !ni.storage.valid() || ni.storage.Capacity > math.MaxInt64-total.Capacity {
+				total = nil
+				break
+			}
+			total.Capacity += ni.storage.Capacity
+			*total.Used += *ni.storage.Used
+			*total.Available += *ni.storage.Available
+		}
+		row = append(row, storageCells(total)...)
+	}
 	pp, _ := pct(totalPodsReq, totalPodsAlloc)
 	row = append(row, levelCell(fmt.Sprintf("%d/%d", totalPodsReq, totalPodsAlloc), podsLevel(pp)))
 
@@ -1541,6 +1793,10 @@ func buildSummaryRow(infos []*nodeInfo, o tableOpts) []cell {
 	}
 
 	row = append(row, dim("-"))
+	if o.wide {
+		_, rows := compactWideTable(tableHeaders(o), [][]cell{row})
+		return rows[0]
+	}
 	return row
 }
 
@@ -1620,6 +1876,14 @@ func renderDetail(w io.Writer, ni *nodeInfo, snap *snapshot, now time.Time) {
 				cont(line)
 			}
 		}
+	}
+
+	if ni.storage.valid() {
+		field("Ephemeral:", fmt.Sprintf("nodefs used %s, available %s / capacity %s", fmtBytes(*ni.storage.Used), fmtBytes(*ni.storage.Available), fmtBytes(ni.storage.Capacity)))
+	} else if err := snap.storageErrors[n.Name]; err != nil {
+		field("Ephemeral:", styleMeta.Sprint("unavailable: "+err.Error()))
+	} else {
+		field("Ephemeral:", styleMeta.Sprint("unavailable: node filesystem statistics not reported"))
 	}
 
 	// Conditions, compact, with problems colored.

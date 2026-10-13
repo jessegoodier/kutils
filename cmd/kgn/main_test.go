@@ -4,10 +4,15 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
+	"math"
+	"net/http"
+	"net/http/httptest"
 	"slices"
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/gookit/color"
 	corev1 "k8s.io/api/core/v1"
@@ -15,6 +20,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/fake"
+	"k8s.io/client-go/rest"
 )
 
 func init() {
@@ -594,6 +600,33 @@ func TestBuildTable(t *testing.T) {
 		}
 	}
 
+	for header, want := range map[string]string{
+		"CPU ALLOC/AVAIL": "4/2.5", "MEM ALLOC/AVAIL": "16G/12G", "EPHEMERAL USED/AVAIL": "-/-",
+	} {
+		idx := slices.Index(headers, header)
+		if idx < 0 || rows[0][idx].text != want {
+			t.Errorf("%s: headers=%v rows=%v", header, headers, rows)
+		}
+	}
+	if idx := slices.Index(headers, "GPU ALLOC/AVAIL"); idx < 0 || rows[1][idx].text != "4/2" {
+		t.Fatal("GPU pair missing or incorrect")
+	}
+	for _, metrics := range []bool{false, true} {
+		for _, gpu := range []bool{false, true} {
+			opts := tableOpts{wide: true, hasMetrics: metrics, showGPU: gpu}
+			h, r := buildTable(infos, opts, now)
+			summary := buildSummaryRow(infos, opts)
+			if len(summary) != len(h) || len(r[0]) != len(h) {
+				t.Fatal("wide summary alignment")
+			}
+			for _, header := range []string{"CPU REQ/LIM", "CPU ALLOC/AVAIL", "MEM REQ/LIM", "MEM ALLOC/AVAIL", "EPHEMERAL USED/AVAIL"} {
+				if !slices.Contains(h, header) {
+					t.Errorf("missing %s", header)
+				}
+			}
+		}
+	}
+
 	headers, _ = buildTable(infos[:1], tableOpts{}, now)
 	for _, h := range headers {
 		if strings.HasPrefix(h, "GPU") {
@@ -727,6 +760,16 @@ func TestPercentageCellRendering(t *testing.T) {
 	if !strings.Contains(lines[1], c.text) || strings.Index(lines[0], "NEXT") != strings.Index(lines[1], "x") {
 		t.Fatalf("percentage text or alignment changed: %q", buf.String())
 	}
+	paired := pairCell(c, percentageCell("96%: 16G", 96, true))
+	if paired.text != "81%: 13.5G/16.7G/96%: 16G" || len(paired.parts) != 5 || paired.parts[0].style.String() != c.parts[0].style.String() || paired.parts[3].style.String() != percentageStyle(96).String() {
+		t.Fatalf("paired percentages lost their styles: %+v", paired)
+	}
+	buf.Reset()
+	printTable(&buf, "", []string{"MEM REQ/LIM", "NEXT"}, [][]cell{{paired, plain("x")}})
+	lines = strings.Split(strings.TrimSpace(buf.String()), "\n")
+	if !strings.Contains(lines[1], paired.text) || strings.Index(lines[0], "NEXT") != strings.Index(lines[1], "x") {
+		t.Fatal("paired cell text or alignment changed")
+	}
 	unknown := percentageCell("512M", 0, false)
 	if unknown.style.String() != stylePlain.String() || len(unknown.parts) != 0 {
 		t.Error("unknown percentage should not get a scale color")
@@ -761,6 +804,79 @@ func TestPrintTableAligns(t *testing.T) {
 	lines := strings.Split(strings.TrimSpace(buf.String()), "\n")
 	if len(lines) != 3 || strings.Index(lines[1], "x") != strings.Index(lines[2], "y") || strings.Index(lines[0], "B") != strings.Index(lines[1], "x") {
 		t.Errorf("misaligned:\n%s", buf.String())
+	}
+}
+
+func TestCPUMemDivider(t *testing.T) {
+	headers := []string{"NAME", "CPU REQ", "CPU USE", "MEM REQ", "MEM USE", "PODS"}
+	rows := [][]cell{{
+		plain("node-a"), plain("39%: 6.2/15.9"), plain("5%"), plain("11%: 13.6G/120.3G"), plain("11%"), plain("54/110"),
+	}}
+	sum := []cell{plain("Summary"), plain("41%"), plain("4%"), plain("16%"), plain("13%"), plain("114/220")}
+	var buf bytes.Buffer
+	printTable(&buf, "", headers, rows, sum)
+	lines := strings.Split(strings.TrimRight(buf.String(), "\n"), "\n")
+	if len(lines) != 4 {
+		t.Fatalf("lines = %d\n%s", len(lines), buf.String())
+	}
+	if !strings.Contains(lines[0], "CPU USE │ MEM REQ") || !strings.Contains(lines[0], "MEM USE │ PODS") {
+		t.Fatalf("header = %q", lines[0])
+	}
+	barsAt := func(s string) []int {
+		var out []int
+		for i := 0; i < len(s); {
+			r, size := utf8.DecodeRuneInString(s[i:])
+			if r == '│' {
+				out = append(out, utf8.RuneCountInString(s[:i]))
+			}
+			i += size
+		}
+		return out
+	}
+	wantBars := barsAt(lines[0])
+	if len(wantBars) != 2 {
+		t.Fatalf("header bars = %v: %q", wantBars, lines[0])
+	}
+	for _, line := range []string{lines[1], lines[3]} {
+		if got := barsAt(line); !slices.Equal(got, wantBars) {
+			t.Errorf("bars = %v, want %v: %q", got, wantBars, line)
+		}
+	}
+	crossAt := func(s string) []int {
+		var out []int
+		for i := 0; i < len(s); {
+			r, size := utf8.DecodeRuneInString(s[i:])
+			if r == '┼' {
+				out = append(out, utf8.RuneCountInString(s[:i]))
+			}
+			i += size
+		}
+		return out
+	}
+	if got := crossAt(lines[2]); !slices.Equal(got, wantBars) || strings.Count(lines[2], "─") == 0 {
+		t.Errorf("summary rule = %q", lines[2])
+	}
+	if strings.Index(lines[0], "MEM REQ") != strings.Index(lines[1], "11%: 13.6G/120.3G") {
+		t.Errorf("memory column drifted:\n%s", buf.String())
+	}
+	if !slices.Equal(tableColumnDividers([]string{"CPU REQ", "MEM REQ"}), []int{0}) {
+		t.Error("divider should follow CPU when usage is hidden")
+	}
+	if len(tableColumnDividers([]string{"RESOURCE", "CAPACITY"})) != 0 {
+		t.Error("detail table should not grow resource dividers")
+	}
+
+	previous := color.Enable
+	color.Enable = true
+	previousLevel := color.ForceSetColorLevel(color.Level16)
+	defer func() {
+		color.Enable = previous
+		color.ForceSetColorLevel(previousLevel)
+	}()
+	buf.Reset()
+	printTable(&buf, "", headers, rows)
+	if !strings.Contains(buf.String(), stylePlain.Sprint("│")) || strings.Contains(buf.String(), styleTitle.Sprint("│")) {
+		t.Errorf("divider should be white:\n%s", buf.String())
 	}
 }
 
@@ -1016,5 +1132,160 @@ func TestCompleteClientErrorIsSilent(t *testing.T) {
 	failing := func(string) (kubernetes.Interface, error) { return nil, errors.New("no cluster") }
 	if got := complete(context.Background(), []string{""}, failing); got != nil {
 		t.Errorf("got %v", got)
+	}
+}
+
+func filesystem(capacity, used, available int64) *filesystemUsage {
+	return &filesystemUsage{Capacity: capacity, Used: &used, Available: &available}
+}
+
+func TestEphemeralStorageHealth(t *testing.T) {
+	for _, tt := range []struct {
+		name string
+		fs   *filesystemUsage
+		low  bool
+	}{
+		{"below", filesystem(10000, 7499, 2501), false},
+		{"exactly 75", filesystem(10000, 7500, 2500), false},
+		{"one byte above", filesystem(10000, 7501, 2499), true},
+		{"full", filesystem(100, 100, 0), true},
+		{"empty", filesystem(100, 0, 100), false},
+		{"reserved blocks", filesystem(100, 70, 20), true},
+		{"large capacity", filesystem(math.MaxInt64, math.MaxInt64, 0), true},
+		{"small capacity", filesystem(3, 3, 0), true},
+		{"missing", nil, false},
+		{"zero capacity", filesystem(0, 0, 0), false},
+		{"negative", filesystem(100, -1, 20), false},
+		{"available exceeds capacity", filesystem(100, 0, 101), false},
+		{"used exceeds capacity", filesystem(100, 101, 0), false},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			snap := &snapshot{nodes: []corev1.Node{{ObjectMeta: metav1.ObjectMeta{Name: "node"}, Status: corev1.NodeStatus{Conditions: []corev1.NodeCondition{cond(corev1.NodeReady, corev1.ConditionTrue)}, Allocatable: rl("ephemeral-storage", "1")}}}, storage: map[string]*filesystemUsage{"node": tt.fs}}
+			ni := buildInfos(snap)[0]
+			want := "Healthy"
+			if tt.low {
+				want = "ephemeral-storage-low"
+			}
+			if got := statusCell(ni); got.text != want {
+				t.Fatalf("status = %q, want %q", got.text, want)
+			}
+			if tt.low && (len(ni.issues) != 1 || ni.issues[0].level != lvlWarn) {
+				t.Fatal("storage warning must participate in unhealthy filtering")
+			}
+			for _, wide := range []bool{false, true} {
+				opts := tableOpts{wide: wide}
+				headers, rows := buildTable([]*nodeInfo{ni}, opts, time.Now())
+				idx := slices.Index(headers, "EPHEMERAL USED/AVAIL")
+				if (idx >= 0) != wide {
+					t.Fatal("storage columns must appear only in wide output")
+				}
+				if len(rows[0]) != len(headers) || len(buildSummaryRow([]*nodeInfo{ni}, opts)) != len(headers) {
+					t.Fatal("column alignment")
+				}
+				if wide && !tt.fs.valid() && rows[0][idx].text != "-/-" {
+					t.Fatal("unknown statistics must show dashes")
+				}
+			}
+		})
+	}
+	// DiskPressure is independent of byte usage (e.g. inode exhaustion).
+	snap := &snapshot{nodes: []corev1.Node{{Status: corev1.NodeStatus{Conditions: []corev1.NodeCondition{cond(corev1.NodeReady, corev1.ConditionTrue), cond(corev1.NodeDiskPressure, corev1.ConditionTrue)}}}}}
+	if got := statusCell(buildInfos(snap)[0]).text; got != "DiskPressure" {
+		t.Fatalf("status = %q", got)
+	}
+}
+
+func TestParseNodeStorage(t *testing.T) {
+	for _, raw := range []string{`{`, `{}`, `{"node":{"fs":{}}}`, `{"node":{"fs":{"capacityBytes":100,"usedBytes":0}}}`, `{"node":{"fs":{"capacityBytes":100,"usedBytes":null,"availableBytes":100}}}`, `{"node":{"fs":{"capacityBytes":100,"usedBytes":-1,"availableBytes":100}}}`, `{"node":{"fs":{"capacityBytes":9223372036854775808,"usedBytes":0,"availableBytes":0}}}`} {
+		if _, err := parseNodeStorage([]byte(raw)); err == nil {
+			t.Errorf("accepted invalid stats: %s", raw)
+		}
+	}
+	fs, err := parseNodeStorage([]byte(`{"node":{"fs":{"capacityBytes":100,"usedBytes":0,"availableBytes":100}},"runtime":{"imageFs":{"usedBytes":999}}}`))
+	if err != nil || *fs.Used != 0 || fs.low() {
+		t.Fatalf("zero usage should be valid: %+v, %v", fs, err)
+	}
+}
+
+type storageTransport func(*http.Request) (*http.Response, error)
+
+func (f storageTransport) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
+
+func TestFetchNodeStorage(t *testing.T) {
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/v1/nodes/healthy/proxy/stats/summary":
+			_, _ = fmt.Fprint(w, `{"node":{"fs":{"capacityBytes":100,"usedBytes":80,"availableBytes":20}}}`)
+		case "/api/v1/nodes/forbidden/proxy/stats/summary":
+			http.Error(w, "forbidden", http.StatusForbidden)
+		case "/api/v1/nodes/slow/proxy/stats/summary":
+			<-r.Context().Done()
+		case "/api/v1/nodes/invalid/proxy/stats/summary":
+			_, _ = fmt.Fprint(w, `{}`)
+		default:
+			http.NotFound(w, r)
+		}
+	})
+	transport := storageTransport(func(r *http.Request) (*http.Response, error) {
+		if err := r.Context().Err(); err != nil {
+			return nil, err
+		}
+		recorder := httptest.NewRecorder()
+		handler.ServeHTTP(recorder, r)
+		if err := r.Context().Err(); err != nil {
+			return nil, err
+		}
+		return recorder.Result(), nil
+	})
+	cs, err := kubernetes.NewForConfig(&rest.Config{Host: "https://cluster.example", Transport: transport})
+	if err != nil {
+		t.Fatal(err)
+	}
+	nodes := []corev1.Node{{ObjectMeta: metav1.ObjectMeta{Name: "healthy"}}, {ObjectMeta: metav1.ObjectMeta{Name: "forbidden"}}, {ObjectMeta: metav1.ObjectMeta{Name: "invalid"}}}
+	stats, errs := fetchNodeStorage(context.Background(), cs, nodes)
+	if len(stats) != 1 || !stats["healthy"].low() || len(errs) != 2 {
+		t.Fatalf("stats=%v errors=%v", stats, errs)
+	}
+	deadlineCtx, deadlineCancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer deadlineCancel()
+	stats, errs = fetchNodeStorage(deadlineCtx, cs, []corev1.Node{{ObjectMeta: metav1.ObjectMeta{Name: "slow"}}})
+	if len(stats) != 0 || !errors.Is(errs["slow"], context.DeadlineExceeded) {
+		t.Fatalf("deadline errors = %v", errs)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	stats, errs = fetchNodeStorage(ctx, cs, nodes)
+	if len(stats) != 0 || len(errs) != len(nodes) {
+		t.Fatalf("canceled fetch: stats=%v errors=%v", stats, errs)
+	}
+}
+
+func TestStorageSummaryAndDetail(t *testing.T) {
+	snap := testSnapshot()
+	snap.storage = map[string]*filesystemUsage{snap.nodes[0].Name: filesystem(100<<30, 80<<30, 20<<30), snap.nodes[1].Name: filesystem(100<<30, 70<<30, 30<<30)}
+	infos := buildInfos(snap)
+	opts := tableOpts{wide: true, hasMetrics: true, showGPU: true}
+	headers, rows := buildTable(infos, opts, time.Now())
+	idx := slices.Index(headers, "EPHEMERAL USED/AVAIL")
+	sum := buildSummaryRow(infos, opts)
+	if rows[0][idx].text != "80G/20G" || sum[idx].text != "150G/50G" || len(sum) != len(headers) {
+		t.Fatalf("rows=%v summary=%v", rows, sum)
+	}
+	infos[0].storage = filesystem(math.MaxInt64, 0, math.MaxInt64)
+	infos[1].storage = filesystem(math.MaxInt64, 0, math.MaxInt64)
+	sum = buildSummaryRow(infos, opts)
+	if sum[idx].text != "-/-" {
+		t.Fatal("overflowing totals must be unknown")
+	}
+	infos[1].storage = nil
+	sum = buildSummaryRow(infos, opts)
+	if sum[idx].text != "-/-" {
+		t.Fatal("partial totals must be unknown")
+	}
+	snap.storageErrors = map[string]error{infos[1].node.Name: errors.New("forbidden")}
+	var buf bytes.Buffer
+	renderDetail(&buf, infos[1], snap, time.Now())
+	if !strings.Contains(buf.String(), "Ephemeral:") || !strings.Contains(buf.String(), "unavailable: forbidden") {
+		t.Fatal(buf.String())
 	}
 }
